@@ -104,17 +104,28 @@ impl RenderOnce for TabBar {
         if self.wrap {
             // Buttons participate in the wrapping flow: nav buttons first, pane
             // buttons last. Row 1 shares horizontal space with them; rows 2..N span
-            // the full width. A single bottom border on this container replaces the
-            // per-section borders and overlay used in the single-row layout.
+            // the full width. Bottom borders come from three cooperating sources,
+            // mirroring the single-row layout: the absolute overlay behind
+            // everything (covers the drop target and any gap), each button
+            // container's own border, and each inactive tab's own border. The
+            // lines coincide pixel-for-pixel, so nothing doubles.
             return h_flex()
                 .id(self.id)
                 .group("tab_bar")
                 .flex_wrap()
+                .relative()
                 .flex_none()
                 .w_full()
                 .bg(cx.theme().colors().tab_bar_background)
-                .border_b_1()
-                .border_color(border_color)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .border_b_1()
+                        .border_color(border_color),
+                )
                 .when(!self.start_children.is_empty(), |this| {
                     this.child(
                         h_flex()
@@ -123,6 +134,7 @@ impl RenderOnce for TabBar {
                             .gap(DynamicSpacing::Base04.rems(cx))
                             .px(DynamicSpacing::Base06.rems(cx))
                             .border_r_1()
+                            .border_b_1()
                             .border_color(border_color)
                             .children(self.start_children),
                     )
@@ -136,6 +148,7 @@ impl RenderOnce for TabBar {
                             .gap(DynamicSpacing::Base04.rems(cx))
                             .px(DynamicSpacing::Base06.rems(cx))
                             .border_l_1()
+                            .border_b_1()
                             .border_color(border_color)
                             .children(self.end_children),
                     )

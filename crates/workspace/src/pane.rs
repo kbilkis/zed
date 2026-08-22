@@ -3624,17 +3624,11 @@ impl Pane {
         );
 
         let tab_bar = if wrap {
+            // Pinned tabs join the wrapping flow as individual children (VS Code
+            // style): an atomic pinned block would wrap as a unit and strand the
+            // nav buttons alone on row 1 when it doesn't fit beside them.
             tab_bar
-                .when(!pinned_tabs.is_empty(), |this| {
-                    // Static divider between pinned and unpinned tabs (the non-wrap path
-                    // uses a scroll-state-driven border, which doesn't apply when wrapping).
-                    this.child(
-                        h_flex()
-                            .children(pinned_tabs)
-                            .border_r_1()
-                            .border_color(cx.theme().colors().border),
-                    )
-                })
+                .children(pinned_tabs)
                 .children(unpinned_tabs)
                 .child(self.render_tab_bar_drop_target(tab_count, cx))
         } else {
@@ -5734,6 +5728,52 @@ mod tests {
                 .any(|b| b.origin.y != tab_bounds[0].origin.y && b.origin.x < first_tab_x),
             "Later rows should start left of the nav-button-offset first row"
         );
+    }
+
+    #[gpui::test]
+    async fn test_non_wrap_with_pinned_tabs_shows_unpinned_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        cx.simulate_resize(size(px(400.), px(300.)));
+
+        // Several pinned tabs, then many unpinned tabs, wrap OFF, separate-row OFF.
+        let item_a = add_labeled_item(&pane, "A", false, cx);
+        let item_b = add_labeled_item(&pane, "B", false, cx);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.pin_tab_at(
+                pane.index_for_item_id(item_a.item_id()).unwrap(),
+                window,
+                cx,
+            );
+            pane.pin_tab_at(
+                pane.index_for_item_id(item_b.item_id()).unwrap(),
+                window,
+                cx,
+            );
+        });
+        for label in ["C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        for (ix, selector) in ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .enumerate()
+        {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} (index {ix}) should render"));
+            assert!(
+                bounds.size.width > px(0.),
+                "{selector} should have nonzero width, got {bounds:?}"
+            );
+        }
     }
 
     #[gpui::test]
