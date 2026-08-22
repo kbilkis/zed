@@ -38,6 +38,7 @@ pub struct Tab {
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
+    wrap: bool,
 }
 
 impl Tab {
@@ -53,7 +54,15 @@ impl Tab {
             start_slot: None,
             end_slot: None,
             children: SmallVec::new(),
+            wrap: false,
         }
+    }
+
+    /// Switches to uniform right-border separators, for use in wrapping layouts
+    /// where the position-relative border scheme cannot know row boundaries.
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
     }
 
     pub fn position(mut self, position: TabPosition) -> Self {
@@ -145,24 +154,44 @@ impl RenderOnce for Tab {
             .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
-            .map(|this| match self.position {
-                TabPosition::First => {
+            .map(|this| {
+                if self.wrap {
+                    // Wrapping layout: every tab draws its right border and no tab
+                    // draws a left border, so each row terminates cleanly and
+                    // adjacent tabs never produce doubled separators, regardless of
+                    // where the active tab sits.
                     if self.selected {
                         this.pl_px().border_r_1().pb_px()
                     } else {
-                        this.pl_px().pr_px().border_b_1()
+                        this.pl_px().border_r_1().border_b_1()
+                    }
+                } else {
+                    match self.position {
+                        TabPosition::First => {
+                            if self.selected {
+                                this.pl_px().border_r_1().pb_px()
+                            } else {
+                                this.pl_px().pr_px().border_b_1()
+                            }
+                        }
+                        TabPosition::Last => {
+                            if self.selected {
+                                this.border_l_1().border_r_1().pb_px()
+                            } else {
+                                this.pl_px().border_b_1().border_r_1()
+                            }
+                        }
+                        TabPosition::Middle(Ordering::Equal) => {
+                            this.border_l_1().border_r_1().pb_px()
+                        }
+                        TabPosition::Middle(Ordering::Less) => {
+                            this.border_l_1().pr_px().border_b_1()
+                        }
+                        TabPosition::Middle(Ordering::Greater) => {
+                            this.border_r_1().pl_px().border_b_1()
+                        }
                     }
                 }
-                TabPosition::Last => {
-                    if self.selected {
-                        this.border_l_1().border_r_1().pb_px()
-                    } else {
-                        this.pl_px().border_b_1().border_r_1()
-                    }
-                }
-                TabPosition::Middle(Ordering::Equal) => this.border_l_1().border_r_1().pb_px(),
-                TabPosition::Middle(Ordering::Less) => this.border_l_1().pr_px().border_b_1(),
-                TabPosition::Middle(Ordering::Greater) => this.border_r_1().pl_px().border_b_1(),
             })
             .cursor_pointer()
             .child(

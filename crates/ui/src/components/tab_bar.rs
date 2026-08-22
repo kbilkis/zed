@@ -11,6 +11,7 @@ pub struct TabBar {
     children: SmallVec<[AnyElement; 2]>,
     end_children: SmallVec<[AnyElement; 2]>,
     scroll_handle: Option<ScrollHandle>,
+    wrap: bool,
 }
 
 impl TabBar {
@@ -21,11 +22,17 @@ impl TabBar {
             children: SmallVec::new(),
             end_children: SmallVec::new(),
             scroll_handle: None,
+            wrap: false,
         }
     }
 
     pub fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
         self.scroll_handle = Some(scroll_handle.clone());
+        self
+    }
+
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
         self
     }
 
@@ -91,13 +98,58 @@ impl ParentElement for TabBar {
 
 impl RenderOnce for TabBar {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let border_color = cx.theme().colors().border;
+        let container_height = Tab::container_height(cx);
+
+        if self.wrap {
+            // Buttons participate in the wrapping flow: nav buttons first, pane
+            // buttons last. Row 1 shares horizontal space with them; rows 2..N span
+            // the full width. A single bottom border on this container replaces the
+            // per-section borders and overlay used in the single-row layout.
+            return h_flex()
+                .id(self.id)
+                .group("tab_bar")
+                .flex_wrap()
+                .flex_none()
+                .w_full()
+                .bg(cx.theme().colors().tab_bar_background)
+                .border_b_1()
+                .border_color(border_color)
+                .when(!self.start_children.is_empty(), |this| {
+                    this.child(
+                        h_flex()
+                            .flex_none()
+                            .h(container_height)
+                            .gap(DynamicSpacing::Base04.rems(cx))
+                            .px(DynamicSpacing::Base06.rems(cx))
+                            .border_r_1()
+                            .border_color(border_color)
+                            .children(self.start_children),
+                    )
+                })
+                .children(self.children)
+                .when(!self.end_children.is_empty(), |this| {
+                    this.child(
+                        h_flex()
+                            .flex_none()
+                            .h(container_height)
+                            .gap(DynamicSpacing::Base04.rems(cx))
+                            .px(DynamicSpacing::Base06.rems(cx))
+                            .border_l_1()
+                            .border_color(border_color)
+                            .children(self.end_children),
+                    )
+                })
+                .into_any_element();
+        }
+
         div()
             .id(self.id)
             .group("tab_bar")
             .flex()
             .flex_none()
             .w_full()
-            .h(Tab::container_height(cx))
+            .h(container_height)
             .bg(cx.theme().colors().tab_bar_background)
             .when(!self.start_children.is_empty(), |this| {
                 this.child(
@@ -107,7 +159,7 @@ impl RenderOnce for TabBar {
                         .px(DynamicSpacing::Base06.rems(cx))
                         .border_b_1()
                         .border_r_1()
-                        .border_color(cx.theme().colors().border)
+                        .border_color(border_color)
                         .children(self.start_children),
                 )
             })
@@ -124,7 +176,7 @@ impl RenderOnce for TabBar {
                             .left_0()
                             .size_full()
                             .border_b_1()
-                            .border_color(cx.theme().colors().border),
+                            .border_color(border_color),
                     )
                     .child(
                         h_flex()
@@ -143,12 +195,13 @@ impl RenderOnce for TabBar {
                         .flex_none()
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .px(DynamicSpacing::Base06.rems(cx))
-                        .border_color(cx.theme().colors().border)
+                        .border_color(border_color)
                         .border_b_1()
                         .border_l_1()
                         .children(self.end_children),
                 )
             })
+            .into_any_element()
     }
 }
 
@@ -197,6 +250,21 @@ impl Component for TabBar {
                             .child(Tab::new("tab2"))
                             .child(Tab::new("tab3"))
                             .end_child(Button::new("end_button", "End"))
+                            .into_any_element(),
+                    )],
+                ),
+                example_group_with_title(
+                    "Wrap",
+                    vec![single_example(
+                        "Wrapped Tabs",
+                        TabBar::new("wrapped_tab_bar")
+                            .wrap(true)
+                            .child(Tab::new("tab1"))
+                            .child(Tab::new("tab2"))
+                            .child(Tab::new("tab3"))
+                            .child(Tab::new("tab4"))
+                            .child(Tab::new("tab5"))
+                            .child(Tab::new("tab6"))
                             .into_any_element(),
                     )],
                 ),

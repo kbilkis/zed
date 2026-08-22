@@ -678,7 +678,7 @@ impl Pane {
             self.was_focused = true;
             self.update_history(self.active_item_index);
             if !self.suppress_scroll && self.items.get(self.active_item_index).is_some() {
-                self.update_active_tab(self.active_item_index);
+                self.update_active_tab(self.active_item_index, cx);
             }
             cx.emit(Event::Focus);
             cx.notify();
@@ -1502,12 +1502,16 @@ impl Pane {
                 focus_changed: focus_item,
             });
 
-            self.update_active_tab(index);
+            self.update_active_tab(index, cx);
             cx.notify();
         }
     }
 
-    fn update_active_tab(&mut self, index: usize) {
+    fn update_active_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if TabBarSettings::get_global(cx).wrap_tabs {
+            // Wrap layout has no horizontal scroll handle attached; nothing to scroll.
+            return;
+        }
         if !self.is_tab_pinned(index) {
             self.suppress_scroll = false;
             self.tab_bar_scroll_handle
@@ -2905,7 +2909,9 @@ impl Pane {
         let has_file_icon = icon.is_some();
 
         let capability = item.capability(cx);
+        let wrap_tabs = TabBarSettings::get_global(cx).wrap_tabs;
         let tab = Tab::new(ix)
+            .wrap(wrap_tabs)
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -3607,31 +3613,50 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> AnyElement {
-        let tab_bar = self
-            .configure_tab_bar_start(
-                TabBar::new("tab_bar"),
-                navigate_backward,
-                navigate_forward,
-                window,
-                cx,
-            )
-            .children(pinned_tabs.len().ne(&0).then(|| {
-                let max_scroll = self.tab_bar_scroll_handle.max_offset().x;
-                // We need to check both because offset returns delta values even when the scroll handle is not scrollable
-                let is_scrolled = self.tab_bar_scroll_handle.offset().x < px(0.);
-                // Avoid flickering when max_offset is very small (< 2px).
-                // The border adds 1-2px which can push max_offset back to 0, creating a loop.
-                let is_scrollable = max_scroll > px(2.0);
-                let has_active_unpinned_tab = self.active_item_index >= self.pinned_tab_count;
-                h_flex()
-                    .children(pinned_tabs)
-                    .when(is_scrollable && is_scrolled, |this| {
-                        this.when(has_active_unpinned_tab, |this| this.border_r_2())
-                            .when(!has_active_unpinned_tab, |this| this.border_r_1())
-                            .border_color(cx.theme().colors().border)
-                    })
-            }))
-            .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx));
+        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+
+        let tab_bar = self.configure_tab_bar_start(
+            TabBar::new("tab_bar").wrap(wrap),
+            navigate_backward,
+            navigate_forward,
+            window,
+            cx,
+        );
+
+        let tab_bar = if wrap {
+            tab_bar
+                .when(!pinned_tabs.is_empty(), |this| {
+                    // Static divider between pinned and unpinned tabs (the non-wrap path
+                    // uses a scroll-state-driven border, which doesn't apply when wrapping).
+                    this.child(
+                        h_flex()
+                            .children(pinned_tabs)
+                            .border_r_1()
+                            .border_color(cx.theme().colors().border),
+                    )
+                })
+                .children(unpinned_tabs)
+                .child(self.render_tab_bar_drop_target(tab_count, cx))
+        } else {
+            tab_bar
+                .children((!pinned_tabs.is_empty()).then(|| {
+                    let max_scroll = self.tab_bar_scroll_handle.max_offset().x;
+                    // We need to check both because offset returns delta values even when the scroll handle is not scrollable
+                    let is_scrolled = self.tab_bar_scroll_handle.offset().x < px(0.);
+                    // Avoid flickering when max_offset is very small (< 2px).
+                    // The border adds 1-2px which can push max_offset back to 0, creating a loop.
+                    let is_scrollable = max_scroll > px(2.0);
+                    let has_active_unpinned_tab = self.active_item_index >= self.pinned_tab_count;
+                    h_flex()
+                        .children(pinned_tabs)
+                        .when(is_scrollable && is_scrolled, |this| {
+                            this.when(has_active_unpinned_tab, |this| this.border_r_2())
+                                .when(!has_active_unpinned_tab, |this| this.border_r_1())
+                                .border_color(cx.theme().colors().border)
+                        })
+                }))
+                .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx))
+        };
         tab_bar.into_any_element()
     }
 
@@ -3645,6 +3670,8 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> AnyElement {
+        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+
         let pinned_tab_bar = self
             .configure_tab_bar_start(
                 TabBar::new("pinned_tab_bar"),
@@ -3662,17 +3689,22 @@ impl Pane {
                     .children(pinned_tabs)
                     .child(self.render_pinned_tab_bar_drop_target(cx)),
             );
+
+        let unpinned_tab_bar = if wrap {
+            TabBar::new("unpinned_tab_bar")
+                .wrap(true)
+                .children(unpinned_tabs)
+                .child(self.render_tab_bar_drop_target(tab_count, cx))
+        } else {
+            TabBar::new("unpinned_tab_bar")
+                .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx))
+        };
+
         v_flex()
             .w_full()
             .flex_none()
             .child(pinned_tab_bar)
-            .child(
-                TabBar::new("unpinned_tab_bar").child(self.render_unpinned_tabs_container(
-                    unpinned_tabs,
-                    tab_count,
-                    cx,
-                )),
-            )
+            .child(unpinned_tab_bar)
             .into_any_element()
     }
 
@@ -5655,6 +5687,82 @@ mod tests {
         assert!(
             pinned_row_bounds.is_none(),
             "pinned_tabs_row should not exist when setting is disabled"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_wrap_tabs_renders_across_multiple_rows(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        // Setting applied AFTER window creation, matching existing pinned-tab test convention.
+        set_wrap_tabs(cx, true);
+
+        // Narrow window forces wrap if many tabs are added.
+        cx.simulate_resize(size(px(300.), px(300.)));
+
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        let tab_bounds: Vec<_> = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .filter_map(|selector| cx.debug_bounds(selector))
+            .collect();
+        assert_eq!(tab_bounds.len(), 6, "all six tabs should render");
+
+        // At least two distinct Y coordinates means tabs wrapped to a new row.
+        let y_coords: std::collections::HashSet<gpui::Pixels> =
+            tab_bounds.iter().map(|b| b.origin.y).collect();
+        assert!(
+            y_coords.len() >= 2,
+            "Wrap should produce multiple rows, got y coords: {y_coords:?}"
+        );
+
+        // Rows below the first span the full width: some tab on a later row starts
+        // left of the first row's start (which is offset by the nav buttons).
+        let first_tab_x = tab_bounds[0].origin.x;
+        assert!(
+            tab_bounds
+                .iter()
+                .any(|b| b.origin.y != tab_bounds[0].origin.y && b.origin.x < first_tab_x),
+            "Later rows should start left of the nav-button-offset first row"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_wrap_tabs_disabled_by_default_does_not_wrap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        cx.simulate_resize(size(px(300.), px(300.)));
+
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        // With wrap disabled, all tabs share one row (same y).
+        let y_coords: std::collections::HashSet<gpui::Pixels> = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .filter_map(|selector| cx.debug_bounds(selector))
+            .map(|bounds| bounds.origin.y)
+            .collect();
+        assert_eq!(
+            y_coords.len(),
+            1,
+            "Non-wrap layout should keep all tabs on one row, got y coords: {y_coords:?}"
         );
     }
 
@@ -9070,6 +9178,14 @@ mod tests {
                     .tab_bar
                     .get_or_insert_default()
                     .show_pinned_tabs_in_separate_row = Some(enabled);
+            });
+        });
+    }
+
+    fn set_wrap_tabs(cx: &mut TestAppContext, enabled: bool) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.tab_bar.get_or_insert_default().wrap_tabs = Some(enabled);
             });
         });
     }
