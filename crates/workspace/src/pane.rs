@@ -448,6 +448,10 @@ pub struct Pane {
     /// content-sized divs (e.g. `Label`) don't receive `flex_grow` distribution
     /// on wrapped lines in GPUI — see TAB_WRAP_GAPS.md (D4).
     wrapped_row_end_widths: Rc<RefCell<HashMap<usize, Pixels>>>,
+    /// Indices of tabs that sit in a wrap row with another row below it.
+    /// Active tabs in these rows keep their bottom border (continuous row
+    /// separators); active tabs in the last row get the connected look.
+    written_mid_row_ixs: Rc<RefCell<HashSet<usize>>>,
     /// This is set to true if a user scroll has occurred more recently than a system scroll
     /// We want to suppress certain system scrolls when the user has intentionally scrolled
     suppress_scroll: bool,
@@ -614,6 +618,7 @@ impl Pane {
             tab_bounds_recorder: Default::default(),
             tab_bar_right_recorder: Default::default(),
             wrapped_row_end_widths: Default::default(),
+            written_mid_row_ixs: Default::default(),
             suppress_scroll: false,
             drag_split_direction: None,
             workspace,
@@ -2928,8 +2933,11 @@ impl Pane {
         let capability = item.capability(cx);
         let wrap_tabs = TabBarSettings::get_global(cx).wrap_tabs;
         let extend_to = self.wrapped_row_end_widths.borrow().get(&ix).copied();
+        let wrap_mid_row =
+            wrap_tabs && self.written_mid_row_ixs.borrow().contains(&ix);
         let tab = Tab::new(ix)
             .wrap(wrap_tabs)
+            .wrap_mid_row(wrap_mid_row)
             .when_some(extend_to, |tab, width| tab.extend_to(width))
             .when(wrap_tabs, |tab| {
                 let recorder = self.tab_bounds_recorder.clone();
@@ -3495,19 +3503,20 @@ impl Pane {
             })
     }
 
-    /// Computes wrap-row extension widths from reported bounds: the last tab
-    /// of every row except the last is extended to the bar's right edge.
-    fn compute_wrapped_row_end_widths(
+    /// Computes wrap-row layout from reported bounds: extension widths (the
+    /// last tab of every row except the last extends to the bar's right edge)
+    /// and mid-row membership (tabs with another row below them).
+    fn compute_wrapped_row_layout(
         recorded: HashMap<usize, Bounds<Pixels>>,
         bar_right: Pixels,
         exclude_pinned_count: usize,
-    ) -> HashMap<usize, Pixels> {
+    ) -> (HashMap<usize, Pixels>, HashSet<usize>) {
         let mut sorted: Vec<(usize, Bounds<Pixels>)> = recorded
             .into_iter()
             .filter(|(ix, _)| *ix >= exclude_pinned_count)
             .collect();
         if sorted.is_empty() {
-            return HashMap::default();
+            return (HashMap::default(), HashSet::default());
         }
         sorted.sort_by(|a, b| {
             a.1.origin
@@ -3539,7 +3548,11 @@ impl Pane {
         // The last row keeps its leftover space for the drop target; every row
         // above extends its rightmost tab to the bar's right edge.
         let mut widths = HashMap::default();
+        let mut mid_row = HashSet::default();
         for row in rows.iter().take(rows.len().saturating_sub(1)) {
+            for (ix, _) in row {
+                mid_row.insert(*ix);
+            }
             if let Some((ix, bounds)) = row.iter().max_by(|a, b| {
                 a.1.right()
                     .partial_cmp(&b.1.right())
@@ -3551,7 +3564,7 @@ impl Pane {
                 }
             }
         }
-        widths
+        (widths, mid_row)
     }
 
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
@@ -3847,6 +3860,7 @@ impl Pane {
                 let bounds_recorder = self.tab_bounds_recorder.clone();
                 let right_recorder = self.tab_bar_right_recorder.clone();
                 let widths = self.wrapped_row_end_widths.clone();
+                let mid_row = self.written_mid_row_ixs.clone();
                 let exclude_pinned = usize::from(
                     TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row,
                 ) * self.pinned_tab_count;
@@ -3858,14 +3872,17 @@ impl Pane {
                                 return;
                             };
                             let recorded = mem::take(&mut *bounds_recorder.borrow_mut());
-                            let computed = Self::compute_wrapped_row_end_widths(
-                                recorded,
-                                bar_right,
-                                exclude_pinned,
-                            );
+                            let (computed_widths, computed_mid_row) =
+                                Self::compute_wrapped_row_layout(
+                                    recorded,
+                                    bar_right,
+                                    exclude_pinned,
+                                );
                             let mut widths = widths.borrow_mut();
-                            if computed != *widths {
-                                *widths = computed;
+                            let mut mid_row = mid_row.borrow_mut();
+                            if computed_widths != *widths || computed_mid_row != *mid_row {
+                                *widths = computed_widths;
+                                *mid_row = computed_mid_row;
                                 cx.notify(pane_entity.entity_id());
                             }
                         },

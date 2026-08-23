@@ -40,6 +40,8 @@ pub struct Tab {
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
     wrap: bool,
+    /// Whether this tab sits in a wrap row that has another row below it.
+    wrap_mid_row: bool,
     extend_to: Option<Pixels>,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
@@ -58,6 +60,7 @@ impl Tab {
             end_slot: None,
             children: SmallVec::new(),
             wrap: false,
+            wrap_mid_row: false,
             extend_to: None,
             report_bounds: None,
         }
@@ -67,6 +70,14 @@ impl Tab {
     /// where the position-relative border scheme cannot know row boundaries.
     pub fn wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
+        self
+    }
+
+    /// Marks this tab as sitting in a wrap row with another row below it. Active
+    /// tabs keep their bottom border in such rows so the row separator stays
+    /// continuous; only active tabs in the last row get the connected look.
+    pub fn wrap_mid_row(mut self, mid_row: bool) -> Self {
+        self.wrap_mid_row = mid_row;
         self
     }
 
@@ -180,14 +191,29 @@ impl RenderOnce for Tab {
             .border_color(cx.theme().colors().border)
             .map(|this| {
                 if self.wrap {
-                    // Wrapping layout: uniform right borders plus top borders.
-                    // A tab that sticks out past the row above has nothing above
-                    // it drawing a separator, so every row carries its own top
-                    // line; the bar's bottom line comes from the TabBar overlay.
+                    // Wrapping layout: every tab draws right and bottom borders,
+                    // no left or top borders. Row separators come from the bottom
+                    // borders of the row above: rows above the last are
+                    // edge-to-edge (explicit extension widths), so their bottom
+                    // borders span the full width, and a row starting left of the
+                    // nav buttons is separated by the nav container's own bottom
+                    // border. A top border would double with whatever sits above
+                    // the bar. The bar's very bottom line under the drop target
+                    // comes from the TabBar overlay; tabs must draw their own
+                    // bottom border because their backgrounds paint over that
+                    // overlay.
                     if self.selected {
-                        this.pl_px().border_r_1().border_t_1().pb_px()
+                        if self.wrap_mid_row {
+                            // Active in a middle row: keep the separator below.
+                            this.pl_px().border_r_1().border_b_1().pb_px()
+                        } else {
+                            // Active in the last row: omit the bottom border so
+                            // the bar's bottom line breaks behind the tab, the
+                            // same connected look as the single-row layout.
+                            this.pl_px().border_r_1().pb_px()
+                        }
                     } else {
-                        this.pl_px().border_r_1().border_t_1()
+                        this.pl_px().border_r_1().border_b_1()
                     }
                 } else {
                     match self.position {
@@ -228,6 +254,11 @@ impl RenderOnce for Tab {
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
+                    // Extended tabs push their end slot (close button) flush to
+                    // the right border instead of packing it after the label.
+                    .when(self.extend_to.is_some(), |this| {
+                        this.child(div().flex_grow_1())
+                    })
                     .child(end_slot)
                     // The relative content box is the canvas's containing block, so
                     // reported bounds track this tab, not an outer ancestor.
