@@ -19,11 +19,11 @@ use collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use futures::{StreamExt, stream::FuturesUnordered};
 use git::{CopyFilePermalink, OpenFilePermalink};
 use gpui::{
-    Action, Anchor, AnyElement, App, AsyncWindowContext, ClickEvent, ClipboardItem, Context, Div,
-    DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
-    Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point, PromptLevel, Render,
-    ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window, actions,
-    anchored, deferred, prelude::*,
+    Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem,
+    Context, Div, DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle,
+    FocusOutEvent, Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point,
+    PromptLevel, Render, ScrollHandle, Stateful, Subscription, Task, TaskExt, WeakEntity,
+    WeakFocusHandle, Window, actions, anchored, canvas, deferred, prelude::*,
 };
 use itertools::Itertools;
 use language::{Capability, DiagnosticSeverity};
@@ -34,6 +34,7 @@ use serde::Deserialize;
 use settings::{Settings, SettingsStore};
 use std::{
     any::Any,
+    cell::RefCell,
     cmp, fmt, mem,
     num::NonZeroUsize,
     path::PathBuf,
@@ -434,6 +435,19 @@ pub struct Pane {
     use_max_tabs: bool,
     _subscriptions: Vec<Subscription>,
     tab_bar_scroll_handle: ScrollHandle,
+    /// Tab bounds reported during the current frame's paint phase, consumed by
+    /// the drop target's canvas (the last reporter in child order).
+    tab_bounds_recorder: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// Right edge of the wrapping tab bar, reported by the bar's own canvas
+    /// and consumed by the drop target's canvas in the same paint phase.
+    tab_bar_right_recorder: Rc<RefCell<Option<Pixels>>>,
+    /// Per-tab explicit widths extending the last tab of each wrap row (all
+    /// rows except the last) to the bar's right edge. Written by the drop
+    /// target's canvas at paint time, read at render time. Explicit widths
+    /// rather than `flex_grow` because flex items containing nested
+    /// content-sized divs (e.g. `Label`) don't receive `flex_grow` distribution
+    /// on wrapped lines in GPUI — see TAB_WRAP_GAPS.md (D4).
+    wrapped_row_end_widths: Rc<RefCell<HashMap<usize, Pixels>>>,
     /// This is set to true if a user scroll has occurred more recently than a system scroll
     /// We want to suppress certain system scrolls when the user has intentionally scrolled
     suppress_scroll: bool,
@@ -597,6 +611,9 @@ impl Pane {
             }))),
             toolbar: cx.new(|_| Toolbar::new()),
             tab_bar_scroll_handle: ScrollHandle::new(),
+            tab_bounds_recorder: Default::default(),
+            tab_bar_right_recorder: Default::default(),
+            wrapped_row_end_widths: Default::default(),
             suppress_scroll: false,
             drag_split_direction: None,
             workspace,
@@ -2910,8 +2927,16 @@ impl Pane {
 
         let capability = item.capability(cx);
         let wrap_tabs = TabBarSettings::get_global(cx).wrap_tabs;
+        let extend_to = self.wrapped_row_end_widths.borrow().get(&ix).copied();
         let tab = Tab::new(ix)
             .wrap(wrap_tabs)
+            .when_some(extend_to, |tab, width| tab.extend_to(width))
+            .when(wrap_tabs, |tab| {
+                let recorder = self.tab_bounds_recorder.clone();
+                tab.report_bounds(Rc::new(move |bounds| {
+                    recorder.borrow_mut().insert(ix, bounds);
+                }))
+            })
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -3470,6 +3495,65 @@ impl Pane {
             })
     }
 
+    /// Computes wrap-row extension widths from reported bounds: the last tab
+    /// of every row except the last is extended to the bar's right edge.
+    fn compute_wrapped_row_end_widths(
+        recorded: HashMap<usize, Bounds<Pixels>>,
+        bar_right: Pixels,
+        exclude_pinned_count: usize,
+    ) -> HashMap<usize, Pixels> {
+        let mut sorted: Vec<(usize, Bounds<Pixels>)> = recorded
+            .into_iter()
+            .filter(|(ix, _)| *ix >= exclude_pinned_count)
+            .collect();
+        if sorted.is_empty() {
+            return HashMap::default();
+        }
+        sorted.sort_by(|a, b| {
+            a.1.origin
+                .y
+                .partial_cmp(&b.1.origin.y)
+                .unwrap_or(cmp::Ordering::Equal)
+                .then(
+                    a.1.origin
+                        .x
+                        .partial_cmp(&b.1.origin.x)
+                        .unwrap_or(cmp::Ordering::Equal),
+                )
+        });
+
+        let mut rows: Vec<Vec<(usize, Bounds<Pixels>)>> = vec![];
+        let mut current_y = sorted[0].1.origin.y;
+        let mut current_row: Vec<(usize, Bounds<Pixels>)> = vec![];
+        for entry in sorted {
+            if (entry.1.origin.y - current_y).abs() < px(0.5) {
+                current_row.push(entry);
+            } else {
+                rows.push(mem::take(&mut current_row));
+                current_y = entry.1.origin.y;
+                current_row.push(entry);
+            }
+        }
+        rows.push(current_row);
+
+        // The last row keeps its leftover space for the drop target; every row
+        // above extends its rightmost tab to the bar's right edge.
+        let mut widths = HashMap::default();
+        for row in rows.iter().take(rows.len().saturating_sub(1)) {
+            if let Some((ix, bounds)) = row.iter().max_by(|a, b| {
+                a.1.right()
+                    .partial_cmp(&b.1.right())
+                    .unwrap_or(cmp::Ordering::Equal)
+            }) {
+                let width = bar_right - bounds.origin.x;
+                if width > bounds.size.width {
+                    widths.insert(*ix, width);
+                }
+            }
+        }
+        widths
+    }
+
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
         if self.workspace.upgrade().is_none() {
             return gpui::Empty.into_any();
@@ -3616,7 +3700,12 @@ impl Pane {
         let wrap = TabBarSettings::get_global(cx).wrap_tabs;
 
         let tab_bar = self.configure_tab_bar_start(
-            TabBar::new("tab_bar").wrap(wrap),
+            TabBar::new("tab_bar").wrap(wrap).when(wrap, |bar| {
+                let right_recorder = self.tab_bar_right_recorder.clone();
+                bar.report_bounds(Rc::new(move |bounds| {
+                    *right_recorder.borrow_mut() = Some(bounds.right());
+                }))
+            }),
             navigate_backward,
             navigate_forward,
             window,
@@ -3685,8 +3774,12 @@ impl Pane {
             );
 
         let unpinned_tab_bar = if wrap {
+            let right_recorder = self.tab_bar_right_recorder.clone();
             TabBar::new("unpinned_tab_bar")
                 .wrap(true)
+                .report_bounds(Rc::new(move |bounds| {
+                    *right_recorder.borrow_mut() = Some(bounds.right());
+                }))
                 .children(unpinned_tabs)
                 .child(self.render_tab_bar_drop_target(tab_count, cx))
         } else {
@@ -3725,11 +3818,65 @@ impl Pane {
         tab_count: usize,
         cx: &mut Context<Pane>,
     ) -> impl IntoElement {
-        div()
-            .id("tab_bar_drop_target")
-            .min_w_6()
-            .h(Tab::container_height(cx))
-            .flex_grow_1()
+        self.tab_bar_drop_target_builder(
+            div()
+                .id("tab_bar_drop_target")
+                .min_w_6()
+                .h(Tab::container_height(cx))
+                .flex_grow_1(),
+            tab_count,
+            cx,
+        )
+    }
+
+    fn tab_bar_drop_target_builder(
+        &self,
+        target: Stateful<Div>,
+        tab_count: usize,
+        cx: &mut Context<Pane>,
+    ) -> Stateful<Div> {
+        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+        target
+            .when(wrap, |this| {
+                // This canvas is the LAST bounds reporter in child order (tabs
+                // report before it), so it consumes what this frame produced:
+                // compute row-end extension widths and re-render only when they
+                // changed. Convergence is guaranteed — a tab sized to exactly
+                // fill its row's leftover space still fits that row, so widths
+                // never invalidate the row membership they were derived from.
+                let bounds_recorder = self.tab_bounds_recorder.clone();
+                let right_recorder = self.tab_bar_right_recorder.clone();
+                let widths = self.wrapped_row_end_widths.clone();
+                let exclude_pinned = usize::from(
+                    TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row,
+                ) * self.pinned_tab_count;
+                let pane_entity = cx.entity();
+                this.child(
+                    canvas(
+                        move |_: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
+                            let Some(bar_right) = right_recorder.borrow_mut().take() else {
+                                return;
+                            };
+                            let recorded = mem::take(&mut *bounds_recorder.borrow_mut());
+                            let computed = Self::compute_wrapped_row_end_widths(
+                                recorded,
+                                bar_right,
+                                exclude_pinned,
+                            );
+                            let mut widths = widths.borrow_mut();
+                            if computed != *widths {
+                                *widths = computed;
+                                cx.notify(pane_entity.entity_id());
+                            }
+                        },
+                        |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+            })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
@@ -3774,8 +3921,12 @@ impl Pane {
             .min_w_6()
             .h(Tab::container_height(cx))
             .flex_grow_1()
-            .border_l_1()
-            .border_color(cx.theme().colors().border)
+            // In wrap mode every tab already draws its own right border, so this
+            // left border would double it. Non-wrap keeps it: there the last
+            // pinned tab has no right border (position-relative scheme).
+            .when(!TabBarSettings::get_global(cx).wrap_tabs, |this| {
+                this.border_l_1().border_color(cx.theme().colors().border)
+            })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
@@ -5774,6 +5925,53 @@ mod tests {
                 "{selector} should have nonzero width, got {bounds:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_wrapped_row_end_tabs_extend_to_bar_edge(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        // Drives frames until extension widths reach their fixed point; a
+        // width feedback loop would keep scheduling notifies and never park.
+        cx.run_until_parked();
+
+        let bounds: Vec<_> = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .filter_map(|selector| cx.debug_bounds(selector))
+            .collect();
+        assert_eq!(bounds.len(), 6, "all six tabs should render");
+
+        let first_row_y = bounds[0].origin.y;
+        let first_row: Vec<_> = bounds.iter().filter(|b| b.origin.y == first_row_y).collect();
+        let second_row: Vec<_> = bounds.iter().filter(|b| b.origin.y != first_row_y).collect();
+        assert!(!second_row.is_empty(), "expected wrapping to occur");
+
+        // Last tab of the first row extends to the bar's right edge (300px window,
+        // no end buttons in this fixture): its right edge should reach ~300.
+        let first_row_max_right = first_row.iter().map(|b| b.right()).max().unwrap();
+        assert!(
+            first_row_max_right >= px(295.),
+            "row-end tab should extend to the bar's right edge, got {first_row_max_right:?}"
+        );
+
+        // Tabs on the last row do not extend: the drop target owns that space.
+        let last_row_max_right = second_row.iter().map(|b| b.right()).max().unwrap();
+        assert!(
+            last_row_max_right < px(295.),
+            "last-row tabs should not extend to the edge, got {last_row_max_right:?}"
+        );
     }
 
     #[gpui::test]

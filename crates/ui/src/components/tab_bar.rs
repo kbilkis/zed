@@ -1,4 +1,6 @@
-use gpui::{AnyElement, ScrollHandle};
+use std::rc::Rc;
+
+use gpui::{AnyElement, Bounds, Pixels, ScrollHandle, canvas};
 use smallvec::SmallVec;
 
 use crate::Tab;
@@ -12,6 +14,7 @@ pub struct TabBar {
     end_children: SmallVec<[AnyElement; 2]>,
     scroll_handle: Option<ScrollHandle>,
     wrap: bool,
+    report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
 
 impl TabBar {
@@ -23,6 +26,7 @@ impl TabBar {
             end_children: SmallVec::new(),
             scroll_handle: None,
             wrap: false,
+            report_bounds: None,
         }
     }
 
@@ -33,6 +37,14 @@ impl TabBar {
 
     pub fn wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
+        self
+    }
+
+    /// Reports the bar's laid-out bounds every frame via a zero-footprint
+    /// canvas overlay (wrap layout only). Used by callers to learn the bar's
+    /// right edge for row-end tab extension widths.
+    pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
+        self.report_bounds = Some(report);
         self
     }
 
@@ -126,6 +138,20 @@ impl RenderOnce for TabBar {
                         .border_b_1()
                         .border_color(border_color),
                 )
+                .when_some(self.report_bounds, |this, report| {
+                    this.child(
+                        canvas(
+                            move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                                report(bounds)
+                            },
+                            |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                })
                 .when(!self.start_children.is_empty(), |this| {
                     this.child(
                         h_flex()
@@ -283,5 +309,77 @@ impl Component for TabBar {
                 ),
             ])
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod wrap_grow_tests {
+    use gpui::{TestAppContext, div, px};
+    use crate::prelude::*;
+
+    /// Minimal repro of a GPUI layout limitation: a flex item whose content
+    /// contains a nested content-sized div (here: `Label`, which renders a
+    /// `LabelLike` wrapping a `Div`) does not receive `flex_grow` distribution
+    /// on a wrapped flex line, while the same item with a plain text child
+    /// does. Raw taffy 0.13 distributes correctly, so the divergence is in
+    /// GPUI's div/measurement layer. Blocks a `flex_grow`-based "last tab of a
+    /// wrap row grows to the row edge"; worked around with explicit pixel
+    /// widths derived from previous-frame bounds. Un-ignore once fixed
+    /// upstream; see TAB_WRAP_GAPS.md (D4).
+    #[gpui::test]
+    #[ignore = "known GPUI limitation, repro for upstream issue"]
+    fn label_content_breaks_flex_grow_on_wrapped_lines(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        struct ProbeView;
+        impl gpui::Render for ProbeView {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::h_flex()
+                    .id("bar")
+                    .flex_wrap()
+                    .w(gpui::px(300.))
+                    .child(
+                        div()
+                            .id("c0")
+                            .h(px(28.))
+                            .child(crate::Label::new("aa").single_line())
+                            .debug_selector(|| "c0".into()),
+                    )
+                    .child(
+                        div()
+                            .id("c1")
+                            .h(px(28.))
+                            .flex_grow_1()
+                            .child(crate::Label::new("bb").single_line())
+                            .debug_selector(|| "c1".into()),
+                    )
+                    .child(
+                        div()
+                            .id("c2")
+                            .h(px(28.))
+                            .child("cc")
+                            .debug_selector(|| "c2".into()),
+                    )
+            }
+        }
+
+        let (_entity, cx) = cx.add_window_view(|_, _| ProbeView);
+        cx.run_until_parked();
+        let with_label = cx.debug_bounds("c1").expect("c1 renders");
+        let plain_text = cx.debug_bounds("c2").expect("c2 renders");
+        assert!(
+            with_label.size.width > plain_text.size.width,
+            "flex_grow_1 should widen the Label-content item ({:?}) beyond the plain text item ({:?})",
+            with_label.size.width,
+            plain_text.size.width
+        );
     }
 }

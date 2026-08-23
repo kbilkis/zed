@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
+use std::rc::Rc;
 
-use gpui::{AnyElement, IntoElement, Stateful};
+use gpui::{AnyElement, Bounds, IntoElement, Pixels, Stateful, canvas};
 use smallvec::SmallVec;
 
 use crate::prelude::*;
@@ -39,6 +40,8 @@ pub struct Tab {
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
     wrap: bool,
+    extend_to: Option<Pixels>,
+    report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
 
 impl Tab {
@@ -55,6 +58,8 @@ impl Tab {
             end_slot: None,
             children: SmallVec::new(),
             wrap: false,
+            extend_to: None,
+            report_bounds: None,
         }
     }
 
@@ -62,6 +67,24 @@ impl Tab {
     /// where the position-relative border scheme cannot know row boundaries.
     pub fn wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
+        self
+    }
+
+    /// Gives the tab an explicit width, used by wrapping layouts to extend the
+    /// last tab of each row to the row's right edge. Explicit widths are used
+    /// instead of `flex_grow` because a flex item whose content contains a
+    /// nested content-sized div (e.g. `Label`) does not receive `flex_grow`
+    /// distribution on wrapped lines in GPUI — see TAB_WRAP_GAPS.md (D4).
+    pub fn extend_to(mut self, width: Pixels) -> Self {
+        self.extend_to = Some(width);
+        self
+    }
+
+    /// Reports this tab's laid-out bounds every frame via a zero-size canvas
+    /// overlay. Bounds arrive after layout, one frame late — the caller derives
+    /// wrap-row membership from previous-frame geometry.
+    pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
+        self.report_bounds = Some(report);
         self
     }
 
@@ -152,18 +175,19 @@ impl RenderOnce for Tab {
 
         self.div
             .h(Tab::container_height(cx))
+            .when_some(self.extend_to, |this, width| this.w(width))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| {
                 if self.wrap {
-                    // Wrapping layout: every tab draws its right border and no tab
-                    // draws a left border, so each row terminates cleanly and
-                    // adjacent tabs never produce doubled separators, regardless of
-                    // where the active tab sits.
+                    // Wrapping layout: uniform right borders plus top borders.
+                    // A tab that sticks out past the row above has nothing above
+                    // it drawing a separator, so every row carries its own top
+                    // line; the bar's bottom line comes from the TabBar overlay.
                     if self.selected {
-                        this.pl_px().border_r_1().pb_px()
+                        this.pl_px().border_r_1().border_t_1().pb_px()
                     } else {
-                        this.pl_px().border_r_1().border_b_1()
+                        this.pl_px().border_r_1().border_t_1()
                     }
                 } else {
                     match self.position {
@@ -204,7 +228,23 @@ impl RenderOnce for Tab {
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
-                    .child(end_slot),
+                    .child(end_slot)
+                    // The relative content box is the canvas's containing block, so
+                    // reported bounds track this tab, not an outer ancestor.
+                    .when_some(self.report_bounds, |this, report| {
+                        this.child(
+                            canvas(
+                                move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                                    report(bounds)
+                                },
+                                |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        )
+                    }),
             )
     }
 }
