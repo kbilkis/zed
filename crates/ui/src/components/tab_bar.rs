@@ -15,6 +15,7 @@ pub struct TabBar {
     scroll_handle: Option<ScrollHandle>,
     wrap: bool,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
+    actions_width_reporter: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
 
 impl TabBar {
@@ -27,6 +28,7 @@ impl TabBar {
             scroll_handle: None,
             wrap: false,
             report_bounds: None,
+            actions_width_reporter: None,
         }
     }
 
@@ -45,6 +47,14 @@ impl TabBar {
     /// right edge for row-end tab extension widths.
     pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
         self.report_bounds = Some(report);
+        self
+    }
+
+    /// Reports the wrap-mode absolute actions container's bounds (wrap layout
+    /// only), so the caller can reserve the first row's right edge and keep
+    /// tabs from sliding underneath the top-right buttons.
+    pub fn report_actions_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
+        self.actions_width_reporter = Some(report);
         self
     }
 
@@ -167,16 +177,40 @@ impl RenderOnce for TabBar {
                 })
                 .children(self.children)
                 .when(!self.end_children.is_empty(), |this| {
+                    // Pane buttons anchor at the top-right corner in wrap mode
+                    // (matching every non-wrap layout) rather than flowing at
+                    // the end of the last row (which would move them whenever
+                    // the row count changes). Out of the wrap flow; the layout
+                    // reserves the first row's right edge via the reported
+                    // width so tabs never slide underneath.
                     this.child(
                         h_flex()
-                            .flex_none()
+                            .id("wrap_bar_actions")
+                            .absolute()
+                            .top_0()
+                            .right_0()
                             .h(container_height)
                             .gap(DynamicSpacing::Base04.rems(cx))
                             .px(DynamicSpacing::Base06.rems(cx))
                             .border_l_1()
                             .border_b_1()
+                            .bg(cx.theme().colors().tab_bar_background)
                             .border_color(border_color)
-                            .children(self.end_children),
+                            .children(self.end_children)
+                            .when_some(self.actions_width_reporter, |this, report| {
+                                this.child(
+                                    canvas(
+                                        move |bounds: Bounds<Pixels>,
+                                              _: &mut Window,
+                                              _: &mut App| report(bounds),
+                                        |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+                                    )
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full(),
+                                )
+                            }),
                     )
                 })
                 .into_any_element();
