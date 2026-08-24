@@ -191,8 +191,8 @@ impl RenderOnce for Tab {
             .border_color(cx.theme().colors().border)
             .map(|this| {
                 if self.wrap {
-                    // Wrapping layout: every tab draws right and bottom borders,
-                    // no left or top borders. Row separators come from the bottom
+                    // Wrapping layout: tabs draw right and bottom borders, no
+                    // left or top borders. Row separators come from the bottom
                     // borders of the row above: rows above the last are
                     // edge-to-edge (explicit extension widths), so their bottom
                     // borders span the full width, and a row starting left of the
@@ -202,18 +202,28 @@ impl RenderOnce for Tab {
                     // comes from the TabBar overlay; tabs must draw their own
                     // bottom border because their backgrounds paint over that
                     // overlay.
+                    //
+                    // Extended (row-end) tabs suppress their right border: a row
+                    // end has no tab to its right to separate from, and the line
+                    // would dangle at the bar's right edge on every non-last row
+                    // (row 1 stops at the actions container's own border; the
+                    // last row's drop target draws none). Same call as VS Code's
+                    // #115046 `last-in-row` rule.
                     if self.selected {
                         if self.wrap_mid_row {
-                            // Active in a middle row: keep the separator below.
-                            this.pl_px().border_r_1().border_b_1().pb_px()
+                            this.pl_px()
+                                .when(self.extend_to.is_none(), |t| t.border_r_1())
+                                .border_b_1()
+                                .pb_px()
                         } else {
-                            // Active in the last row: omit the bottom border so
-                            // the bar's bottom line breaks behind the tab, the
-                            // same connected look as the single-row layout.
-                            this.pl_px().border_r_1().pb_px()
+                            this.pl_px()
+                                .when(self.extend_to.is_none(), |t| t.border_r_1())
+                                .pb_px()
                         }
                     } else {
-                        this.pl_px().border_r_1().border_b_1()
+                        this.pl_px()
+                            .when(self.extend_to.is_none(), |t| t.border_r_1())
+                            .border_b_1()
                     }
                 } else {
                     match self.position {
