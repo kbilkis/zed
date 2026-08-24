@@ -136,6 +136,10 @@ impl RenderOnce for TabBar {
                 .group("tab_bar")
                 .flex_wrap()
                 .relative()
+                // Clips the absolute row-fill strips, whose placement is one
+                // frame stale: during a drag a strip may overhang the right
+                // edge by a few px for one frame.
+                .overflow_hidden()
                 .flex_none()
                 .w_full()
                 .bg(cx.theme().colors().tab_bar_background)
