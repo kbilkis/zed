@@ -42,7 +42,10 @@ pub struct Tab {
     wrap: bool,
     /// Whether this tab sits in a wrap row that has another row below it.
     wrap_mid_row: bool,
-    extend_to: Option<Pixels>,
+    /// Whether a filler strip follows this tab (wrap row-end). Such tabs
+    /// suppress their right border: the filler visually continues the tab, so
+    /// there is nothing to separate from at the seam.
+    wrap_row_end: bool,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
 
@@ -61,7 +64,7 @@ impl Tab {
             children: SmallVec::new(),
             wrap: false,
             wrap_mid_row: false,
-            extend_to: None,
+            wrap_row_end: false,
             report_bounds: None,
         }
     }
@@ -73,21 +76,18 @@ impl Tab {
         self
     }
 
+    /// Marks this tab as followed by a wrap filler strip (row-end); see the
+    /// `wrap_row_end` field.
+    pub fn wrap_row_end(mut self, row_end: bool) -> Self {
+        self.wrap_row_end = row_end;
+        self
+    }
+
     /// Marks this tab as sitting in a wrap row with another row below it. Active
     /// tabs keep their bottom border in such rows so the row separator stays
     /// continuous; only active tabs in the last row get the connected look.
     pub fn wrap_mid_row(mut self, mid_row: bool) -> Self {
         self.wrap_mid_row = mid_row;
-        self
-    }
-
-    /// Gives the tab an explicit width, used by wrapping layouts to extend the
-    /// last tab of each row to the row's right edge. Explicit widths are used
-    /// instead of `flex_grow` because a flex item whose content contains a
-    /// nested content-sized div (e.g. `Label`) does not receive `flex_grow`
-    /// distribution on wrapped lines in GPUI — see TAB_WRAP_GAPS.md (D4).
-    pub fn extend_to(mut self, width: Pixels) -> Self {
-        self.extend_to = Some(width);
         self
     }
 
@@ -186,7 +186,6 @@ impl RenderOnce for Tab {
 
         self.div
             .h(Tab::container_height(cx))
-            .when_some(self.extend_to, |this, width| this.w(width))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| {
@@ -212,17 +211,17 @@ impl RenderOnce for Tab {
                     if self.selected {
                         if self.wrap_mid_row {
                             this.pl_px()
-                                .when(self.extend_to.is_none(), |t| t.border_r_1())
+                                .when(!self.wrap_row_end, |t| t.border_r_1())
                                 .border_b_1()
                                 .pb_px()
                         } else {
                             this.pl_px()
-                                .when(self.extend_to.is_none(), |t| t.border_r_1())
+                                .when(!self.wrap_row_end, |t| t.border_r_1())
                                 .pb_px()
                         }
                     } else {
                         this.pl_px()
-                            .when(self.extend_to.is_none(), |t| t.border_r_1())
+                            .when(!self.wrap_row_end, |t| t.border_r_1())
                             .border_b_1()
                     }
                 } else {
@@ -264,11 +263,6 @@ impl RenderOnce for Tab {
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
-                    // Extended tabs push their end slot (close button) flush to
-                    // the right border instead of packing it after the label.
-                    .when(self.extend_to.is_some(), |this| {
-                        this.child(div().flex_grow_1())
-                    })
                     .child(end_slot)
                     // The relative content box is the canvas's containing block, so
                     // reported bounds track this tab, not an outer ancestor.

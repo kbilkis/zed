@@ -348,18 +348,60 @@ impl Component for TabBar {
 
 #[cfg(test)]
 mod wrap_grow_tests {
-    use gpui::{TestAppContext, div, px};
+    use gpui::{TestAppContext, div, px, size};
     use crate::prelude::*;
+
+    /// Confirms the filler-strip mechanism: an EMPTY flex item with
+    /// `flex_grow_1` (plus an ABSOLUTE child, which never participates in flex
+    /// sizing) receives leftover distribution on wrapped lines — unlike items
+    /// whose in-flow content is measured text (see the Label repro below).
+    /// This is what lets wrap row-ends fill at layout time with zero latency.
+    #[gpui::test]
+    fn empty_grow_filler_extends_on_wrapped_lines(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.draw(gpui::Point::default(), size(px(150.), px(100.)), |_, _| {
+            crate::h_flex()
+                .id("bar")
+                .flex_wrap()
+                .w_full()
+                .child(div().id("c0").h(px(28.)).w(px(50.)).debug_selector(|| "c0".into()))
+                .child(div().id("c1").h(px(28.)).w(px(50.)).debug_selector(|| "c1".into()))
+                .child(
+                    div()
+                        .id("filler")
+                        .h(px(28.))
+                        .flex_grow_1()
+                        .min_w_0()
+                        .relative()
+                        // absolute child: must not affect the filler's flex sizing
+                        .child(
+                            div()
+                                .id("filler_child")
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .w(px(28.))
+                                .h(px(28.)),
+                        )
+                        .debug_selector(|| "filler".into()),
+                )
+                .child(div().id("c2").h(px(28.)).w(px(70.)).debug_selector(|| "c2".into()))
+        });
+        let filler = cx.debug_bounds("filler").expect("filler renders");
+        assert!(
+            filler.size.width > px(20.),
+            "empty grow filler should absorb row leftover, got {filler:?}"
+        );
+    }
 
     /// Minimal repro of a GPUI layout limitation: a flex item whose content
     /// contains a nested content-sized div (here: `Label`, which renders a
     /// `LabelLike` wrapping a `Div`) does not receive `flex_grow` distribution
     /// on a wrapped flex line, while the same item with a plain text child
     /// does. Raw taffy 0.13 distributes correctly, so the divergence is in
-    /// GPUI's div/measurement layer. Blocks a `flex_grow`-based "last tab of a
-    /// wrap row grows to the row edge"; worked around with explicit pixel
-    /// widths derived from previous-frame bounds. Un-ignore once fixed
-    /// upstream; see TAB_WRAP_GAPS.md (D4).
+    /// GPUI's div/measurement layer. This is why wrap row-ends use empty
+    /// filler strips (see test above) instead of `flex_grow` on the tab
+    /// itself. Un-ignore once fixed upstream; see TAB_WRAP_GAPS.md (D4).
     #[gpui::test]
     #[ignore = "known GPUI limitation, repro for upstream issue"]
     fn label_content_breaks_flex_grow_on_wrapped_lines(cx: &mut TestAppContext) {
