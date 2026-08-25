@@ -4636,9 +4636,7 @@ fn window_and_layout_page() -> SettingsPage {
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("tab_bar.wrap_tabs"),
-                    pick: |settings_content| {
-                        settings_content.tab_bar.as_ref()?.wrap_tabs.as_ref()
-                    },
+                    pick: |settings_content| settings_content.tab_bar.as_ref()?.wrap_tabs.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.tab_bar.get_or_insert_default().wrap_tabs = value;
                     },

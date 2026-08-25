@@ -42,25 +42,17 @@ impl TabBar {
         self
     }
 
-    /// Reports the bar's laid-out bounds every frame via a zero-footprint
-    /// canvas overlay (wrap layout only). Used by callers to learn the bar's
-    /// right edge for row-end tab extension widths.
+    /// Reports the bar's laid-out bounds each frame (wrap layout only);
+    /// values arrive one layout pass late.
     pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
         self.report_bounds = Some(report);
         self
     }
 
-    /// Reports the wrap-mode absolute actions container's bounds (wrap layout
-    /// only), so the caller can reserve the first row's right edge and keep
-    /// tabs from sliding underneath the top-right buttons.
     pub fn report_actions_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
         self.report_actions_bounds = Some(report);
         self
     }
-
-
-
-
 
     pub fn start_children_mut(&mut self) -> &mut SmallVec<[AnyElement; 2]> {
         &mut self.start_children
@@ -122,20 +114,14 @@ impl ParentElement for TabBar {
     }
 }
 
-
-
 impl RenderOnce for TabBar {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let border_color = cx.theme().colors().border;
         let container_height = Tab::container_height(cx);
 
         if self.wrap {
-            // Manual row layout: children are pre-built row containers (the
-            // pane computes rows from natural tab widths); this bar only
-            // stacks them, anchors the CTAs top-right, and reports its
-            // bounds. No flex_wrap (pure flexbox cannot reserve capacity on
-            // the first row only), no padding reserve (row 1 carries its own
-            // right padding), no strips.
+            // Children are pre-built row containers (the pane plans rows
+            // from measured natural widths); this bar only stacks them.
             return v_flex()
                 .id(self.id)
                 .group("tab_bar")
@@ -168,20 +154,15 @@ impl RenderOnce for TabBar {
                     )
                 })
                 .when(!self.start_children.is_empty(), |this| {
-                    // Wrap mode renders nav buttons INSIDE row 1 (pane-built);
-                    // start_children reaching here is a programming error.
                     log::warn!("TabBar wrap mode received start_children; they are ignored (nav belongs to row 1)");
                     this
                 })
                 .children(self.children)
                 .when(!self.end_children.is_empty(), |this| {
-                    // CTAs anchor top-right. The CONTAINER (background,
-                    // borders, width reporter) always paints: its border_b is
-                    // part of the bar's bottom border line, and hiding it on
-                    // unfocused panes would leave a gap in that line. The
-                    // PANE hides the buttons themselves (visibility on the
-                    // delivered end_children) so the measured width stays
-                    // focus-independent.
+                    // CTAs anchor top-right; the pane hides the buttons
+                    // (visibility) on unfocused panes while this container
+                    // keeps painting — its bottom border is part of the
+                    // bar's border line.
                     this.child(
                         h_flex()
                             .id("wrap_bar_actions")
@@ -347,43 +328,46 @@ impl Component for TabBar {
 
 #[cfg(test)]
 mod wrap_grow_tests {
-    use gpui::{TestAppContext, div, px, size};
     use crate::prelude::*;
+    use gpui::{TestAppContext, div, px, size};
 
     /// Does a canvas inside a `visibility: hidden` subtree still prepaint
     /// (fire its reporting callback)? Decides whether wrap-mode CTA width
     /// measurement can live inside an invisibly-gated actions container.
     #[gpui::test]
     fn canvas_fires_inside_invisible(cx: &mut TestAppContext) {
-        use std::rc::Rc;
-        use std::cell::Cell;
         use gpui::canvas;
+        use std::cell::Cell;
+        use std::rc::Rc;
         let fired = Rc::new(Cell::new(0));
         let cx = cx.add_empty_window();
         cx.draw(gpui::Point::default(), size(px(300.), px(100.)), |_, _| {
             let fired = fired.clone();
-            div()
-                .id("root")
-                .child(
-                    h_flex()
-                        .id("hidden_actions")
-                        .invisible()
-                        .h(px(28.))
-                        .px_2()
-                        .child(div().w(px(60.)).h(px(28.)))
-                        .child(
-                            canvas(
-                                move |_: gpui::Bounds<gpui::Pixels>, _: &mut gpui::Window, _: &mut gpui::App| {
-                                    fired.set(fired.get() + 1);
-                                },
-                                |_: gpui::Bounds<gpui::Pixels>, _: (), _: &mut gpui::Window, _: &mut gpui::App| {},
-                            )
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full(),
-                        ),
-                )
+            div().id("root").child(
+                h_flex()
+                    .id("hidden_actions")
+                    .invisible()
+                    .h(px(28.))
+                    .px_2()
+                    .child(div().w(px(60.)).h(px(28.)))
+                    .child(
+                        canvas(
+                            move |_: gpui::Bounds<gpui::Pixels>,
+                                  _: &mut gpui::Window,
+                                  _: &mut gpui::App| {
+                                fired.set(fired.get() + 1);
+                            },
+                            |_: gpui::Bounds<gpui::Pixels>,
+                             _: (),
+                             _: &mut gpui::Window,
+                             _: &mut gpui::App| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    ),
+            )
         });
         assert!(
             fired.get() > 0,
@@ -423,10 +407,34 @@ mod wrap_grow_tests {
                 // 4 tabs of 40px: without the spacer, row 1 fits
                 // nav(30)+3*40=150 exactly; with the spacer (50), row 1 fits
                 // nav+spacer+one tab = 120, second tab (80 more) must wrap.
-                .child(div().id("t0").h(px(28.)).w(px(40.)).debug_selector(|| "t0".into()))
-                .child(div().id("t1").h(px(28.)).w(px(40.)).debug_selector(|| "t1".into()))
-                .child(div().id("t2").h(px(28.)).w(px(40.)).debug_selector(|| "t2".into()))
-                .child(div().id("t3").h(px(28.)).w(px(40.)).debug_selector(|| "t3".into()))
+                .child(
+                    div()
+                        .id("t0")
+                        .h(px(28.))
+                        .w(px(40.))
+                        .debug_selector(|| "t0".into()),
+                )
+                .child(
+                    div()
+                        .id("t1")
+                        .h(px(28.))
+                        .w(px(40.))
+                        .debug_selector(|| "t1".into()),
+                )
+                .child(
+                    div()
+                        .id("t2")
+                        .h(px(28.))
+                        .w(px(40.))
+                        .debug_selector(|| "t2".into()),
+                )
+                .child(
+                    div()
+                        .id("t3")
+                        .h(px(28.))
+                        .w(px(40.))
+                        .debug_selector(|| "t3".into()),
+                )
         });
         // nav(30) + spacer(50) + t0(40) = 120 fits row 1; t1 would end at
         // 160 > 150, so the spacer forces t1 to wrap.
@@ -472,7 +480,11 @@ mod wrap_grow_tests {
                 )
         });
         let probe = cx.debug_bounds("probe").expect("probe renders");
-        eprintln!("PADBOX probe right={:?} width={:?}", probe.right(), probe.size.width);
+        eprintln!(
+            "PADBOX probe right={:?} width={:?}",
+            probe.right(),
+            probe.size.width
+        );
         assert!(
             probe.size.width > px(250.),
             "absolute size_full child should span the padding box (~300), got {probe:?}"
@@ -492,8 +504,20 @@ mod wrap_grow_tests {
                 .id("bar")
                 .flex_wrap()
                 .w_full()
-                .child(div().id("c0").h(px(28.)).w(px(50.)).debug_selector(|| "c0".into()))
-                .child(div().id("c1").h(px(28.)).w(px(50.)).debug_selector(|| "c1".into()))
+                .child(
+                    div()
+                        .id("c0")
+                        .h(px(28.))
+                        .w(px(50.))
+                        .debug_selector(|| "c0".into()),
+                )
+                .child(
+                    div()
+                        .id("c1")
+                        .h(px(28.))
+                        .w(px(50.))
+                        .debug_selector(|| "c1".into()),
+                )
                 .child(
                     div()
                         .id("filler")
@@ -513,7 +537,13 @@ mod wrap_grow_tests {
                         )
                         .debug_selector(|| "filler".into()),
                 )
-                .child(div().id("c2").h(px(28.)).w(px(70.)).debug_selector(|| "c2".into()))
+                .child(
+                    div()
+                        .id("c2")
+                        .h(px(28.))
+                        .w(px(70.))
+                        .debug_selector(|| "c2".into()),
+                )
         });
         let filler = cx.debug_bounds("filler").expect("filler renders");
         assert!(

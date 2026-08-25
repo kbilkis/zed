@@ -68,41 +68,28 @@ impl Tab {
         }
     }
 
-    /// Switches to wrap-mode border/geometry behavior.
     pub fn wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
         self
     }
 
-    /// Marks this tab as the last of its (non-final) wrap row: suppresses the
-    /// right border (nothing to its right; same call as VS Code #115046).
     pub fn wrap_row_end(mut self, row_end: bool) -> Self {
         self.wrap_row_end = row_end;
         self
     }
 
-    /// Extends this tab to `width` total width, filling its row's leftover;
-    /// also pushes the end slot (close/unpin) flush to the tab's right edge
-    /// via a spacer.
     pub fn extend_to(mut self, width: Pixels) -> Self {
         self.extend_to = Some(width);
         self
     }
 
-
-
-
-    /// Marks this tab as sitting in a wrap row with another row below it. Active
-    /// tabs keep their bottom border in such rows so the row separator stays
-    /// continuous; only active tabs in the last row get the connected look.
     pub fn wrap_mid_row(mut self, mid_row: bool) -> Self {
         self.wrap_mid_row = mid_row;
         self
     }
 
-    /// Reports this tab's laid-out bounds every frame via a zero-size canvas
-    /// overlay. Bounds arrive after layout, one frame late — the caller derives
-    /// wrap-row membership from previous-frame geometry.
+    /// Reports this tab's laid-out bounds each frame; values arrive one
+    /// layout pass late.
     pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
         self.report_bounds = Some(report);
         self
@@ -195,24 +182,17 @@ impl RenderOnce for Tab {
 
         self.div
             .h(Tab::container_height(cx))
-            // Wrapping tabs never shrink: there is no ellipsis to make room
-            // for, so sub-pixel shrink only added knife-edge wobble at
-            // boundary widths (row overflow distributed 1-2px across tabs,
-            // differently frame to frame).
+            // No ellipsis to make room for; shrink only caused sub-pixel
+            // wobble at boundary widths.
             .when(self.wrap, |this| this.flex_none())
             .when_some(self.extend_to, |this, width| this.w(width))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| {
                 if self.wrap {
-                    // Manual row layout: row identity is known exactly at
-                    // render, so identity-driven borders are lag-free. Right
-                    // border on all but row-end tabs; bottom border on all
-                    // tabs of non-final rows; the active tab in the FINAL row
-                    // gets the connected look (pb).
-                    // Row-end tabs never draw a right border: nothing sits to
-                    // their right except the row boundary (or the CTAs' own
-                    // left border on row 1) — an extra line doubles it.
+                    // Row-end tabs omit the right border: nothing sits to
+                    // their right, and drawing it would double the CTAs' left
+                    // border on row 1.
                     if self.selected {
                         if self.wrap_mid_row {
                             this.pl_px()
@@ -268,14 +248,7 @@ impl RenderOnce for Tab {
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
-                    // Extended tabs push their end slot (close/unpin) flush to
-                    // the right edge; the label's char budget is sized to the
-                    // extension upstream (see Pane::render_tab_inner).
                     .when(self.extend_to.is_some(), |this| {
-                        // Extended tab: spacer fills the extension, pushing
-                        // the end slot right; the slot rides in a box whose
-                        // own right padding IS the gap to the border (padding
-                        // inside the last, non-growing box is real width).
                         this.child(div().flex_grow_1())
                     })
                     .child(
