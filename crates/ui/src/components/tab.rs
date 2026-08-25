@@ -210,9 +210,15 @@ impl RenderOnce for Tab {
                     // border on all but row-end tabs; bottom border on all
                     // tabs of non-final rows; the active tab in the FINAL row
                     // gets the connected look (pb).
+                    // Row-end tabs never draw a right border: nothing sits to
+                    // their right except the row boundary (or the CTAs' own
+                    // left border on row 1) — an extra line doubles it.
                     if self.selected {
                         if self.wrap_mid_row {
-                            this.pl_px().border_r_1().border_b_1().pb_px()
+                            this.pl_px()
+                                .when(!self.wrap_row_end, |t| t.border_r_1())
+                                .border_b_1()
+                                .pb_px()
                         } else {
                             this.pl_px()
                                 .when(!self.wrap_row_end, |t| t.border_r_1())
@@ -266,9 +272,19 @@ impl RenderOnce for Tab {
                     // the right edge; the label's char budget is sized to the
                     // extension upstream (see Pane::render_tab_inner).
                     .when(self.extend_to.is_some(), |this| {
+                        // Extended tab: spacer fills the extension, pushing
+                        // the end slot right; the slot rides in a box whose
+                        // own right padding IS the gap to the border (padding
+                        // inside the last, non-growing box is real width).
                         this.child(div().flex_grow_1())
                     })
-                    .child(end_slot)
+                    .child(
+                        div()
+                            .when(self.extend_to.is_some(), |box_| {
+                                box_.pr(DynamicSpacing::Base04.px(cx))
+                            })
+                            .child(end_slot),
+                    )
                     // The relative content box is the canvas's containing block, so
                     // reported bounds track this tab, not an outer ancestor.
                     .when_some(self.report_bounds, |this, report| {

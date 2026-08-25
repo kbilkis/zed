@@ -3060,6 +3060,7 @@ impl Pane {
             cx,
         );
 
+
         let icon = self.tab_icon_element(item, is_active, window, cx);
 
         let settings = ItemSettings::get_global(cx);
@@ -3713,9 +3714,9 @@ impl Pane {
             // arithmetic disagreement with taffy clips (rows never wrap
             // internally) instead of reflowing.
             let actions = *self.wrap_actions_width.borrow();
-            let reserve = actions
-                .map(|w| w + ui::DynamicSpacing::Base04.px(cx))
-                .unwrap_or(px(0.));
+            // Reserve exactly the CTA width: row 1's extension ends flush at
+            // the CTAs' left border (one clean line, no breathing-room gap).
+            let reserve = actions.unwrap_or(px(0.));
             let nav_w = *self.wrap_nav_width.borrow();
             let widths = self.wrapped_tab_natural_widths.borrow().clone();
 
