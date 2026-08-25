@@ -42,10 +42,8 @@ pub struct Tab {
     wrap: bool,
     /// Whether this tab sits in a wrap row that has another row below it.
     wrap_mid_row: bool,
-    /// Whether a filler strip follows this tab (wrap row-end). Such tabs
-    /// suppress their right border: the filler visually continues the tab, so
-    /// there is nothing to separate from at the seam.
     wrap_row_end: bool,
+    extend_to: Option<Pixels>,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
 
@@ -65,23 +63,34 @@ impl Tab {
             wrap: false,
             wrap_mid_row: false,
             wrap_row_end: false,
+            extend_to: None,
             report_bounds: None,
         }
     }
 
-    /// Switches to uniform right-border separators, for use in wrapping layouts
-    /// where the position-relative border scheme cannot know row boundaries.
+    /// Switches to wrap-mode border/geometry behavior.
     pub fn wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
         self
     }
 
-    /// Marks this tab as followed by a wrap filler strip (row-end); see the
-    /// `wrap_row_end` field.
+    /// Marks this tab as the last of its (non-final) wrap row: suppresses the
+    /// right border (nothing to its right; same call as VS Code #115046).
     pub fn wrap_row_end(mut self, row_end: bool) -> Self {
         self.wrap_row_end = row_end;
         self
     }
+
+    /// Extends this tab to `width` total width, filling its row's leftover;
+    /// also pushes the end slot (close/unpin) flush to the tab's right edge
+    /// via a spacer.
+    pub fn extend_to(mut self, width: Pixels) -> Self {
+        self.extend_to = Some(width);
+        self
+    }
+
+
+
 
     /// Marks this tab as sitting in a wrap row with another row below it. Active
     /// tabs keep their bottom border in such rows so the row separator stays
@@ -186,34 +195,24 @@ impl RenderOnce for Tab {
 
         self.div
             .h(Tab::container_height(cx))
+            // Wrapping tabs never shrink: there is no ellipsis to make room
+            // for, so sub-pixel shrink only added knife-edge wobble at
+            // boundary widths (row overflow distributed 1-2px across tabs,
+            // differently frame to frame).
+            .when(self.wrap, |this| this.flex_none())
+            .when_some(self.extend_to, |this, width| this.w(width))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| {
                 if self.wrap {
-                    // Wrapping layout: tabs draw right and bottom borders, no
-                    // left or top borders. Row separators come from the bottom
-                    // borders of the row above: rows above the last are
-                    // edge-to-edge (explicit extension widths), so their bottom
-                    // borders span the full width, and a row starting left of the
-                    // nav buttons is separated by the nav container's own bottom
-                    // border. A top border would double with whatever sits above
-                    // the bar. The bar's very bottom line under the drop target
-                    // comes from the TabBar overlay; tabs must draw their own
-                    // bottom border because their backgrounds paint over that
-                    // overlay.
-                    //
-                    // Extended (row-end) tabs suppress their right border: a row
-                    // end has no tab to its right to separate from, and the line
-                    // would dangle at the bar's right edge on every non-last row
-                    // (row 1 stops at the actions container's own border; the
-                    // last row's drop target draws none). Same call as VS Code's
-                    // #115046 `last-in-row` rule.
+                    // Manual row layout: row identity is known exactly at
+                    // render, so identity-driven borders are lag-free. Right
+                    // border on all but row-end tabs; bottom border on all
+                    // tabs of non-final rows; the active tab in the FINAL row
+                    // gets the connected look (pb).
                     if self.selected {
                         if self.wrap_mid_row {
-                            this.pl_px()
-                                .when(!self.wrap_row_end, |t| t.border_r_1())
-                                .border_b_1()
-                                .pb_px()
+                            this.pl_px().border_r_1().border_b_1().pb_px()
                         } else {
                             this.pl_px()
                                 .when(!self.wrap_row_end, |t| t.border_r_1())
@@ -263,6 +262,12 @@ impl RenderOnce for Tab {
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
+                    // Extended tabs push their end slot (close/unpin) flush to
+                    // the right edge; the label's char budget is sized to the
+                    // extension upstream (see Pane::render_tab_inner).
+                    .when(self.extend_to.is_some(), |this| {
+                        this.child(div().flex_grow_1())
+                    })
                     .child(end_slot)
                     // The relative content box is the canvas's containing block, so
                     // reported bounds track this tab, not an outer ancestor.

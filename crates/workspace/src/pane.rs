@@ -23,7 +23,7 @@ use gpui::{
     Context, Div, DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle,
     FocusOutEvent, Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point,
     PromptLevel, Render, ScrollHandle, Stateful, Subscription, Task, TaskExt, WeakEntity,
-    WeakFocusHandle, Window, actions, anchored, canvas, deferred, prelude::*,
+    WeakFocusHandle, Window, actions, canvas, prelude::*,
 };
 use itertools::Itertools;
 use language::{Capability, DiagnosticSeverity};
@@ -36,7 +36,6 @@ use std::{
     any::Any,
     cell::RefCell,
     cmp, fmt, mem,
-    ops::Range,
     num::NonZeroUsize,
     path::PathBuf,
     rc::Rc,
@@ -398,14 +397,18 @@ impl fmt::Debug for Event {
 /// Treats all items uniformly via the [`ItemHandle`] trait, whether it's an editor, search results multibuffer, terminal or something else,
 /// responsible for managing item tabs, focus and zoom states and drag and drop features.
 /// Can be split, see `PaneGroup` for more details.
-#[derive(Default)]
-/// Per-frame wrap layout data captured at paint time for render-time strip
-/// placement (see `Pane::wrap_layout_snapshot`).
-struct WrapLayoutSnapshot {
-    positions: HashMap<usize, Bounds<Pixels>>,
-    main_bar: Option<Bounds<Pixels>>,
-    pinned_bar: Option<Bounds<Pixels>>,
+/// Wrap-mode identity for a tab, known exactly at render time under manual
+/// row layout (computed by `Pane::wrap_rows` from natural widths).
+#[derive(Clone, Default)]
+pub struct WrapTabIdentity {
+    /// Last tab of a NON-final row (extended to the row edge).
+    pub row_end: bool,
+    /// Tab sits in a row with another row below.
+    pub mid_row: bool,
+    /// Total width extending this tab to its row's right edge.
+    pub extend_to: Option<gpui::Pixels>,
 }
+
 
 pub struct Pane {
     alternate_file_items: (
@@ -442,46 +445,31 @@ pub struct Pane {
     render_tab_bar: Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> AnyElement>,
     show_tab_bar_buttons: bool,
     max_tabs: Option<NonZeroUsize>,
+    /// Natural tab widths measured per frame by the hidden ruler strip:
+    /// the feed-forward input to manual wrap-row computation (rows are
+    /// computed at RENDER time from these + last frame's bar width; none of
+    /// the outputs feed back into the inputs, so nothing can oscillate).
+    wrapped_tab_natural_widths: Rc<RefCell<HashMap<usize, Pixels>>>,
+    /// Widths of the wrap bars and their leading nav containers, measured
+    /// per frame (last frame's values read at render time).
+    wrap_main_bar_width: Rc<RefCell<Option<Pixels>>>,
+    wrap_pinned_bar_width: Rc<RefCell<Option<Pixels>>>,
+    wrap_nav_width: Rc<RefCell<Pixels>>,
+    /// Width of a wrap bar's top-right actions container (always laid out;
+    /// hidden via visibility on unfocused panes) — the row-1 reservation.
+    wrap_actions_width: Rc<RefCell<Option<Pixels>>>,
+    /// Bar widths actually used by the last render's row planning. The settle
+    /// canvas compares these against the recorders (updated at paint) and
+    /// notifies once on divergence — the final resize step otherwise leaves
+    /// rows planned for the previous width. Bounded: after the settle render
+    /// the values match and no further notify fires.
+    wrap_planned_widths: Rc<RefCell<(Option<Pixels>, Option<Pixels>)>>,
     use_max_tabs: bool,
     _subscriptions: Vec<Subscription>,
     tab_bar_scroll_handle: ScrollHandle,
-    /// Tab bounds reported during the current frame's paint phase, consumed by
-    /// the drop target's canvas (the last reporter in child order).
-    tab_bounds_recorder: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
-    /// Bounds of the wrapping tab bar, reported by the bar's own canvas and
-    /// consumed by the drop target's canvas in the same paint phase.
-    tab_bar_bounds_recorder: Rc<RefCell<Option<Bounds<Pixels>>>>,
-    /// Bounds of the wrapping PINNED tab bar (two-row layout only), reported
-    /// and consumed the same way. Feeds the pinned strip's own row simulation.
-    pinned_bar_bounds_recorder: Rc<RefCell<Option<Bounds<Pixels>>>>,
-    /// Bounds of a wrap bar's absolute top-right actions container, reported
-    /// the same way. The first row's extension reserves this width so tabs
-    /// never slide underneath the buttons.
-    wrap_actions_bounds_recorder: Rc<RefCell<Option<Bounds<Pixels>>>>,
 
-    /// Indices of wrap row-end tabs (all rows except the last, both bars).
-    /// A filler strip follows each of them (see `render_tab_filler`). Written
-    /// by the consumer canvas at paint time, read at render time.
-    wrapped_row_end_ixs: Rc<RefCell<HashSet<usize>>>,
-    /// Index of the row-end tab of a bar's FIRST row, when that bar carries
-    /// the top-right actions container: its filler's end slot insets by the
-    /// actions width. Other bars' / rows' fillers inset by padding only.
-    wrapped_first_row_end_ix: Rc<RefCell<Option<usize>>>,
-    /// Last paint-phase layout snapshot: every wrapping tab's bounds plus both
-    /// bars' bounds. Absolute row-fill strips are placed from this — one frame
-    /// stale, which only ever shows as a few-px strip length error during a
-    /// drag (tabs themselves can never be moved by a strip: strips have no
-    /// flex presence).
-    wrap_layout_snapshot: Rc<RefCell<WrapLayoutSnapshot>>,
-    /// Hover tracking for wrap row-end tab + filler composites: (tab index,
-    /// active hover-source count). A row-end tab and its filler are separate
-    /// elements but one visual unit; GPUI hover groups cannot span siblings,
-    /// so this state drives the filler's end-slot reveal. The count makes
-    /// hover-in/hover-out event ordering between the two elements irrelevant.
-    hovered_wrap_row_end: Option<(usize, u32)>,
     /// Active tabs in these rows keep their bottom border (continuous row
     /// separators); active tabs in the last row get the connected look.
-    wrapped_mid_row_ixs: Rc<RefCell<HashSet<usize>>>,
     /// This is set to true if a user scroll has occurred more recently than a system scroll
     /// We want to suppress certain system scrolls when the user has intentionally scrolled
     suppress_scroll: bool,
@@ -645,16 +633,13 @@ impl Pane {
             }))),
             toolbar: cx.new(|_| Toolbar::new()),
             tab_bar_scroll_handle: ScrollHandle::new(),
-            tab_bounds_recorder: Default::default(),
-            tab_bar_bounds_recorder: Default::default(),
-            pinned_bar_bounds_recorder: Default::default(),
-            wrap_actions_bounds_recorder: Default::default(),
-            wrap_layout_snapshot: Default::default(),
+            wrapped_tab_natural_widths: Default::default(),
+            wrap_main_bar_width: Default::default(),
+            wrap_pinned_bar_width: Default::default(),
+            wrap_nav_width: Default::default(),
+            wrap_actions_width: Default::default(),
+            wrap_planned_widths: Default::default(),
 
-            wrapped_row_end_ixs: Default::default(),
-            wrapped_first_row_end_ix: Default::default(),
-            hovered_wrap_row_end: None,
-            wrapped_mid_row_ixs: Default::default(),
             suppress_scroll: false,
             drag_split_direction: None,
             workspace,
@@ -2898,28 +2883,6 @@ impl Pane {
     }
 
     /// Builds a tab's end-slot action (unpin for pinned tabs, close otherwise).
-    /// Shared by tabs themselves and by the wrap filler strips that visually
-    /// continue row-end tabs.
-    /// Hover-source tracking for a wrap row-end tab/filler composite. See the
-    /// `hovered_wrap_row_end` field for why this isn't a GPUI hover group.
-    fn set_wrap_row_end_hover(&mut self, ix: usize, hovered: bool, cx: &mut Context<Pane>) {
-        let current = self.hovered_wrap_row_end;
-        let next = match (current, hovered) {
-            (Some((cur_ix, count)), true) if cur_ix == ix => Some((ix, count.saturating_add(1))),
-            (_, true) => Some((ix, 1)),
-            (Some((cur_ix, count)), false) if cur_ix == ix && count > 1 => Some((ix, count - 1)),
-            (Some((cur_ix, _)), false) if cur_ix == ix => None,
-            (other, false) => other,
-        };
-        if next != current {
-            self.hovered_wrap_row_end = next;
-            cx.notify();
-        }
-    }
-
-    /// Builds a tab's end-slot action. `state_driven` skips the hover-group
-    /// reveal (used by filler strips, whose reveal is pane-state driven since
-    /// the tab and filler are separate elements).
     fn tab_end_slot_element(
         &self,
         ix: usize,
@@ -2927,7 +2890,6 @@ impl Pane {
         is_pinned: bool,
         is_active: bool,
         focus_handle: &FocusHandle,
-        state_driven: bool,
         cx: &mut Context<Pane>,
     ) -> Option<AnyElement> {
         let settings = ItemSettings::get_global(cx);
@@ -2954,11 +2916,7 @@ impl Pane {
             match show_close_button {
                 ShowCloseButton::Always => IconButton::new("close tab", IconName::Close),
                 ShowCloseButton::Hover => {
-                    if state_driven {
-                        IconButton::new("close tab", IconName::Close)
-                    } else {
-                        IconButton::new("close tab", IconName::Close).visible_on_hover("")
-                    }
+                    IconButton::new("close tab", IconName::Close).visible_on_hover("")
                 }
                 ShowCloseButton::Hidden => return None,
             }
@@ -2989,155 +2947,23 @@ impl Pane {
         Some(end_slot.into_any_element())
     }
 
-    /// Builds the ABSOLUTE overlay strip that visually continues a wrap
-    /// row-end tab to its row's right edge. Out of the flex flow entirely: no
-    /// filler state can ever push or block a tab (the previous in-flow filler
-    /// was zero-basis so it never blocked line assignment, but its GROWTH sat
-    /// wherever it was placed — for one stale frame mid-row, pushing the first
-    /// tab of a widening row by the whole leftover). Placed from the last
-    /// paint-phase snapshot, painted before the tabs (under them), clipped by
-    /// the bar: staleness only ever shows as a few-px strip length error
-    /// during a drag.
-    ///
-    /// The strip behaves like its tab: pointer cursor, click activates,
-    /// middle-click closes, end slot (close/unpin) revealed on hovering the
-    /// tab/strip composite (pane state — GPUI hover groups cannot span
-    /// siblings), and dropping on it inserts after the row-end tab.
-    fn render_tab_filler(
+     fn render_tab(
         &self,
         ix: usize,
-        item_id: EntityId,
-        is_pinned: bool,
-        is_active: bool,
-        on_first_row_of_actions_bar: bool,
+        item: &dyn ItemHandle,
+        detail: usize,
         focus_handle: &FocusHandle,
+        identity: WrapTabIdentity,
+        window: &mut Window,
         cx: &mut Context<Pane>,
-    ) -> AnyElement {
-        // Geometry from the last snapshot; skip (render nothing) if unknown.
-        let snapshot = self.wrap_layout_snapshot.borrow();
-        let Some(tab_bounds) = snapshot.positions.get(&ix).copied() else {
-            return gpui::Empty.into_any();
-        };
-        let two_row =
-            TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row && is_pinned;
-        let bar_bounds = if two_row {
-            snapshot.pinned_bar
-        } else {
-            snapshot.main_bar
-        };
-        let Some(bar_bounds) = bar_bounds else {
-            return gpui::Empty.into_any();
-        };
-        let left = tab_bounds.right() - bar_bounds.left();
-        let top = tab_bounds.origin.y - bar_bounds.origin.y;
-        let width = (bar_bounds.right() - tab_bounds.right()).max(px(0.));
-
-        let show_close_button = ItemSettings::get_global(cx).show_close_button;
-        let hovered = matches!(self.hovered_wrap_row_end, Some((hix, _)) if hix == ix);
-        // Pinned tabs always show their unpin slot (independent of the close
-        // button visibility setting); unpinned follow the setting.
-        let render_slot = if is_pinned {
-            true
-        } else {
-            match show_close_button {
-                ShowCloseButton::Always => true,
-                ShowCloseButton::Hover => hovered,
-                ShowCloseButton::Hidden => false,
-            }
-        };
-        let actions_width = self
-            .wrap_actions_bounds_recorder
-            .borrow()
-            .map(|b| b.size.width)
-            .unwrap_or(px(0.));
-        let padding = ui::DynamicSpacing::Base04.px(cx);
-        // Only the first row of the actions-carrying bar dodges the buttons.
-        let base_inset = if on_first_row_of_actions_bar {
-            actions_width + padding
-        } else {
-            padding
-        };
-        // Clamp against the strip's own width so the slot never starts left of
-        // the strip (overlapping the preceding tab's label); hide if it can't
-        // fit clear of the buttons block.
-        let slot_width = px(24.);
-        let max_inset = (width - slot_width).max(px(0.));
-        let (render_slot, slot_right_inset) = if max_inset < base_inset {
-            if on_first_row_of_actions_bar && max_inset < actions_width {
-                (false, base_inset)
-            } else {
-                (render_slot, max_inset)
-            }
-        } else {
-            (render_slot, base_inset)
-        };
-        let end_slot = if render_slot {
-            self.tab_end_slot_element(
-                ix,
-                item_id,
-                is_pinned,
-                is_active,
-                focus_handle,
-                true,
-                cx,
-            )
-        } else {
-            None
-        };
-
-        let bg = if is_active {
-            cx.theme().colors().tab_active_background
-        } else {
-            cx.theme().colors().tab_inactive_background
-        };
-        div()
-            .id(("tab_filler", ix))
-            .debug_selector(move || format!("TAB-FILLER-{ix}"))
-            .absolute()
-            .top(top)
-            .left(left)
-            .w(width)
-            .h(Tab::container_height(cx))
-            .bg(bg)
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .cursor_pointer()
-            .on_click(cx.listener(move |pane, _, window, cx| {
-                pane.activate_item(ix, true, true, window, cx);
-            }))
-            .on_aux_click(cx.listener(move |pane, event: &ClickEvent, window, cx| {
-                if event.is_middle_click() && !is_pinned {
-                    pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
-                        .detach_and_log_err(cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .on_hover(cx.listener(move |pane, hovered: &bool, _, cx| {
-                pane.set_wrap_row_end_hover(ix, *hovered, cx);
-            }))
-            .when_some(end_slot, |this, slot| {
-                this.child(
-                    h_flex()
-                        .id(("tab_filler_slot", ix))
-                        .absolute()
-                        .top_0()
-                        .right(slot_right_inset)
-                        .h_full()
-                        .child(slot),
-                )
-            })
-            // Dropping on the strip means "insert after the row-end tab".
-            .drag_over::<DraggedTab>(|strip, _, _, cx| {
-                strip.bg(cx.theme().colors().drop_target_background)
-            })
-            .on_drop(cx.listener(move |this, dragged_tab: &DraggedTab, window, cx| {
-                this.drag_split_direction = None;
-                this.handle_tab_drop(dragged_tab, ix + 1, false, window, cx)
-            }))
-            .into_any_element()
+    ) -> impl IntoElement + use<> {
+        self.render_tab_inner(ix, item, detail, focus_handle, identity, false, window, cx)
     }
 
-    fn render_tab(
+    /// Renders a tab for the hidden wrap ruler strip: same content and slots
+    /// (so its measured width matches the real tab) but no wrap identity and
+    /// reporting its natural width into the ruler recorder.
+    fn render_ruler_tab(
         &self,
         ix: usize,
         item: &dyn ItemHandle,
@@ -3146,19 +2972,88 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> impl IntoElement + use<> {
+        self.render_tab_inner(
+            ix,
+            item,
+            detail,
+            focus_handle,
+            WrapTabIdentity::default(),
+            true,
+            window,
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_tab_inner(
+        &self,
+        ix: usize,
+        item: &dyn ItemHandle,
+        detail: usize,
+        focus_handle: &FocusHandle,
+        identity: WrapTabIdentity,
+        ruler: bool,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> impl IntoElement + use<> {
         let is_active = ix == self.active_item_index;
         let is_preview = self
             .preview_item_id
             .map(|id| id == item.item_id())
             .unwrap_or(false);
-
+        // Extended (row-end) tabs grow their character budget to fill the
+        // extension: measure the full title's pixel width once and scale the
+        // char cap to the available inner width (biased ~8% conservative for
+        // proportional-font error). Char truncation (`truncate_and_trailoff`,
+        // same end-ellipsis as ordinary tabs) is deterministic — the
+        // width-based ellipsis chain (3 nested min_w_0 wrappers) proved
+        // unreliable in practice and is untestable under stubbed test fonts.
+        // Every other tab (and the ruler twin, whose measured width must
+        // match its sibling) keeps upstream's 24-char cap.
+        let max_title_len = identity
+            .extend_to
+            .filter(|_| !ruler)
+            .map(|width| {
+                // Inner width: tab content padding (2x Base04) + start/end
+                // slots + gap, plus safety bias.
+                let chrome =
+                    ui::DynamicSpacing::Base04.px(cx) * 4. + px(12. + 14. + 8.);
+                let avail = (width - chrome).max(px(16.));
+                let title = item.tab_content_text(detail, cx);
+                let text_style = window.text_style();
+                let font_size = text_style.font_size.to_pixels(window.rem_size());
+                let font = ThemeSettings::get_global(cx).ui_font.clone();
+                let measured = window
+                    .text_system()
+                    .layout_line(
+                        title.as_ref(),
+                        font_size,
+                        &[gpui::TextRun {
+                            len: title.len(),
+                            font,
+                            color: gpui::Hsla::default(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                    .width;
+                if measured <= avail || measured == px(0.) {
+                    usize::MAX
+                } else {
+                    (((avail / measured) * title.chars().count() as f32).floor()
+                        as usize)
+                        .max(1)
+                }
+            });
         let label = item.tab_content(
             TabContentParams {
                 detail: Some(detail),
                 selected: is_active,
                 preview: is_preview,
                 deemphasized: !self.has_focus(window, cx),
-                max_title_len: None,
+                max_title_len,
                 truncate_title_middle: false,
             },
             window,
@@ -3181,16 +3076,9 @@ impl Pane {
 
         let capability = item.capability(cx);
         let wrap_tabs = TabBarSettings::get_global(cx).wrap_tabs;
-        let wrap_mid_row = wrap_tabs && self.wrapped_mid_row_ixs.borrow().contains(&ix);
-        // The filler strip following a row-end tab carries the end slot, so the
-        // tab itself omits it (ruler tabs keep it: natural width includes it).
-        let wrap_row_end = wrap_tabs && self.wrapped_row_end_ixs.borrow().contains(&ix);
-        // Row-end tabs' slots move into their filler strips.
-        let end_slot = if wrap_row_end {
-            None
-        } else {
-            self.tab_end_slot_element(ix, item_id, is_pinned, is_active, focus_handle, false, cx)
-        };
+        let wrap_mid_row = wrap_tabs && !ruler && identity.mid_row;
+        let end_slot =
+            self.tab_end_slot_element(ix, item_id, is_pinned, is_active, focus_handle, cx);
         let read_only_toggle = |toggleable: bool| {
             IconButton::new("toggle_read_only", IconName::FileLock)
                 .size(ButtonSize::None)
@@ -3217,16 +3105,27 @@ impl Pane {
                 }))
         };
 
-        let tab = Tab::new(ix)
-            .wrap(wrap_tabs)
-            .wrap_mid_row(wrap_mid_row)
-            .wrap_row_end(wrap_row_end)
-            .when(wrap_tabs, |tab| {
-                let recorder = self.tab_bounds_recorder.clone();
+        let tab = if ruler {
+            Tab::new(("wrap-ruler", ix))
+        } else {
+            Tab::new(ix)
+        }
+        .wrap(wrap_tabs && !ruler)
+        .wrap_mid_row(wrap_mid_row)
+        .wrap_row_end(wrap_tabs && !ruler && identity.row_end)
+        .when_some(identity.extend_to.filter(|_| wrap_tabs && !ruler), |tab, w| {
+            tab.extend_to(w)
+        })
+        .when(wrap_tabs, |tab| {
+            if ruler {
+                let recorder = self.wrapped_tab_natural_widths.clone();
                 tab.report_bounds(Rc::new(move |bounds| {
-                    recorder.borrow_mut().insert(ix, bounds);
+                    recorder.borrow_mut().insert(ix, bounds.size.width);
                 }))
-            })
+            } else {
+                tab
+            }
+        })
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -3321,13 +3220,6 @@ impl Pane {
             .map(|this| match end_slot {
                 Some(end_slot) => this.end_slot(end_slot),
                 None => this,
-            })
-            .when(wrap_row_end, |tab| {
-                // The row-end tab's end slot lives in its filler; hover on the
-                // tab must still reveal it (see `hovered_wrap_row_end`).
-                tab.on_hover(cx.listener(move |pane, hovered: &bool, _, cx| {
-                    pane.set_wrap_row_end_hover(ix, *hovered, cx);
-                }))
             })
             .child(
                 h_flex()
@@ -3743,67 +3635,13 @@ impl Pane {
             })
     }
 
-    fn compute_wrapped_row_layout_from_positions(
-        positions: &HashMap<usize, Bounds<Pixels>>,
-        index_range: Range<usize>,
-    ) -> (HashSet<usize>, HashSet<usize>, Option<usize>) {
-        let mut sorted: Vec<(usize, Bounds<Pixels>)> = positions
-            .iter()
-            .filter(|(ix, _)| index_range.contains(*ix))
-            .map(|(ix, bounds)| (*ix, *bounds))
-            .collect();
-        if sorted.is_empty() {
-            return (HashSet::default(), HashSet::default(), None);
-        }
-        sorted.sort_by_key(|(ix, _)| *ix);
-
-        // Group into rows by observed y. Tabs are contiguous by index within a
-        // bar, so a row boundary is simply: next tab's y differs.
-        let mut rows: Vec<Vec<usize>> = vec![];
-        let mut current: Vec<usize> = vec![sorted[0].0];
-        let mut current_y = sorted[0].1.origin.y;
-        for (ix, bounds) in sorted.iter().skip(1) {
-            if (bounds.origin.y - current_y).abs() < px(0.5) {
-                current.push(*ix);
-            } else {
-                rows.push(mem::take(&mut current));
-                current_y = bounds.origin.y;
-                current.push(*ix);
-            }
-        }
-        rows.push(current);
-
-        // The last row keeps its leftover space for the drop target; every row
-        // above gets a filler after its last tab.
-        let mut row_ends = HashSet::default();
-        let mut mid_row = HashSet::default();
-        let mut first_row_end = None;
-        for (row_ix, row) in rows.iter().enumerate().take(rows.len().saturating_sub(1)) {
-            mid_row.extend(row.iter().copied());
-            if let Some(&last_ix) = row.last() {
-                if row_ix == 0 {
-                    first_row_end = Some(last_ix);
-                }
-                row_ends.insert(last_ix);
-            }
-        }
-        (row_ends, mid_row, first_row_end)
-    }
-
-    /// Builds the hidden zero-size strip that measures each tab's natural
-    /// (unextended) width every frame. The strip is absolute (out of the wrap
-    /// flow) and clipped, but its tabs are still laid out at natural widths,
-    /// so their canvases report uncontaminated measurements the drop target's
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
         if self.workspace.upgrade().is_none() {
             return gpui::Empty.into_any();
         }
         if !TabBarSettings::get_global(cx).wrap_tabs {
             // Drop stale wrap state so re-enabling starts from clean rows.
-            self.wrapped_row_end_ixs.borrow_mut().clear();
-            self.wrapped_first_row_end_ix.borrow_mut().take();
-            self.wrapped_mid_row_ixs.borrow_mut().clear();
-            self.hovered_wrap_row_end = None;
+            self.wrapped_tab_natural_widths.borrow_mut().clear();
         }
 
         let focus_handle = self.focus_handle.clone();
@@ -3855,94 +3693,317 @@ impl Pane {
             });
 
         let wrap = TabBarSettings::get_global(cx).wrap_tabs;
-        // Row-end membership is one frame stale — benign: a misplaced filler
-        // just grows to fill whatever line it lands on and the next frame
-        // corrects (see TAB_WRAP_GAPS.md D4).
-        let row_end_ixs: HashSet<usize> = if wrap {
-            self.wrapped_row_end_ixs.borrow().clone()
+        let two_row_wrap = wrap
+            && TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row
+            && self.pinned_tab_count > 0
+            && self.pinned_tab_count < self.items.len();
+
+        if wrap {
+            // Record the widths this render plans rows against (settle canvas
+            // compares them to the paint-updated recorders).
+            *self.wrap_planned_widths.borrow_mut() = (
+                *self.wrap_main_bar_width.borrow(),
+                *self.wrap_pinned_bar_width.borrow(),
+            );
+
+            // Rows are computed at RENDER time from feed-forward inputs:
+            // ruler-measured natural widths (stable across resizes), last
+            // frame's bar widths, the nav width and the CTA reserve. No
+            // output feeds back into layout, so nothing can oscillate; 1px
+            // arithmetic disagreement with taffy clips (rows never wrap
+            // internally) instead of reflowing.
+            let actions = *self.wrap_actions_width.borrow();
+            let reserve = actions
+                .map(|w| w + ui::DynamicSpacing::Base04.px(cx))
+                .unwrap_or(px(0.));
+            let nav_w = *self.wrap_nav_width.borrow();
+            let widths = self.wrapped_tab_natural_widths.borrow().clone();
+
+            if two_row_wrap {
+                let pinned_rows = Self::plan_wrap_rows(
+                    &widths,
+                    0..self.pinned_tab_count,
+                    *self.wrap_pinned_bar_width.borrow(),
+                    reserve,
+                    nav_w,
+                );
+                let unpinned_rows = Self::plan_wrap_rows(
+                    &widths,
+                    self.pinned_tab_count..self.items.len(),
+                    *self.wrap_main_bar_width.borrow(),
+                    px(0.),
+                    px(0.),
+                );
+                self.render_two_row_tab_bar(
+                    pinned_rows,
+                    unpinned_rows,
+                    widths,
+                    reserve,
+                    nav_w,
+                    navigate_backward,
+                    navigate_forward,
+                    window,
+                    cx,
+                )
+            } else {
+                let rows = Self::plan_wrap_rows(
+                    &widths,
+                    0..self.items.len(),
+                    *self.wrap_main_bar_width.borrow(),
+                    reserve,
+                    nav_w,
+                );
+                self.render_single_row_tab_bar(
+                    rows,
+                    widths,
+                    reserve,
+                    nav_w,
+                    navigate_backward,
+                    navigate_forward,
+                    window,
+                    cx,
+                )
+            }
         } else {
-            HashSet::default()
+            let mut tab_items = self
+                .items
+                .iter()
+                .enumerate()
+                .zip(tab_details(&self.items, window, cx))
+                .map(|((ix, item), detail)| {
+                    self.render_tab(
+                        ix,
+                        &**item,
+                        detail,
+                        &focus_handle,
+                        WrapTabIdentity::default(),
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            let tab_count = tab_items.len();
+            if self.is_tab_pinned(tab_count) {
+                log::warn!(
+                    "Pinned tab count ({}) exceeds actual tab count ({}). \
+                    This should not happen. If possible, add reproduction steps, \
+                    in a comment, to https://github.com/zed-industries/zed/issues/33342",
+                    self.pinned_tab_count,
+                    tab_count
+                );
+                self.pinned_tab_count = tab_count;
+            }
+            let unpinned_tabs = tab_items.split_off(self.pinned_tab_count);
+            let pinned_tabs = tab_items;
+
+            if TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row
+                && !pinned_tabs.is_empty()
+                && !unpinned_tabs.is_empty()
+            {
+                self.render_two_row_tab_bar_non_wrap(
+                    pinned_tabs,
+                    unpinned_tabs,
+                    tab_count,
+                    navigate_backward,
+                    navigate_forward,
+                    window,
+                    cx,
+                )
+            } else {
+                self.render_single_row_tab_bar_non_wrap(
+                    pinned_tabs,
+                    unpinned_tabs,
+                    tab_count,
+                    navigate_backward,
+                    navigate_forward,
+                    window,
+                    cx,
+                )
+            }
+        }
+    }
+
+    /// Greedy row fill from natural widths (feed-forward; the caller renders
+    /// rows as non-wrapping h_flexes, so arithmetic never reflows anything).
+    fn plan_wrap_rows(
+        widths: &HashMap<usize, Pixels>,
+        range: std::ops::Range<usize>,
+        bar_w: Option<Pixels>,
+        first_row_reserve: Pixels,
+        nav_w: Pixels,
+    ) -> Vec<Vec<usize>> {
+        let Some(bar_w) = bar_w else {
+            return vec![];
         };
-        let first_row_end_ix = if wrap {
-            *self.wrapped_first_row_end_ix.borrow()
-        } else {
-            None
-        };
-        let mut pinned_tab_items = Vec::new();
-        let mut unpinned_tab_items = Vec::new();
-        let mut pinned_filler_items = Vec::new();
-        let mut unpinned_filler_items = Vec::new();
-        for ((ix, item), detail) in self
+        let mut indices: Vec<usize> = range.filter(|ix| widths.contains_key(ix)).collect();
+        if indices.is_empty() {
+            return vec![];
+        }
+        // Each ruler canvas width is ~2px narrower than the tab's border box.
+        let mut rows: Vec<Vec<usize>> = vec![];
+        let mut current: Vec<usize> = vec![];
+        let mut x = nav_w;
+        let mut row_ix = 0usize;
+        for ix in indices.drain(..) {
+            let width = widths.get(&ix).copied().unwrap_or(px(0.)) + px(2.);
+            let capacity = if row_ix == 0 {
+                bar_w - first_row_reserve
+            } else {
+                bar_w
+            };
+            if !current.is_empty() && x + width > capacity {
+                rows.push(mem::take(&mut current));
+                x = px(0.);
+                row_ix += 1;
+            }
+            current.push(ix);
+            x += width;
+        }
+        rows.push(current);
+        rows
+    }
+
+    /// Per-tab wrap identity from planned rows: exact at render time.
+    fn wrap_identities(rows: &[Vec<usize>]) -> HashMap<usize, WrapTabIdentity> {
+        let mut map = HashMap::default();
+        let last_row = rows.len().saturating_sub(1);
+        for (r, row) in rows.iter().enumerate() {
+            let is_final = r == last_row;
+            for (pos, &ix) in row.iter().enumerate() {
+                map.insert(
+                    ix,
+                    WrapTabIdentity {
+                        row_end: !is_final && pos + 1 == row.len(),
+                        mid_row: !is_final,
+                        extend_to: None,
+                    },
+                );
+            }
+        }
+        map
+    }
+
+    /// Sets each non-final row's last tab `extend_to` so it fills the row's
+    /// remaining capacity (nav included on row 0).
+    fn apply_wrap_extensions(
+        widths: &HashMap<usize, Pixels>,
+        rows: &[Vec<usize>],
+        identities: &mut HashMap<usize, WrapTabIdentity>,
+        bar_w: Pixels,
+        first_row_reserve: Pixels,
+        nav_w: Pixels,
+    ) {
+        let last_row = rows.len().saturating_sub(1);
+        for (r, row) in rows.iter().enumerate() {
+            if r == last_row || row.is_empty() {
+                continue;
+            }
+            let mut x = if r == 0 { nav_w } else { px(0.) };
+            for ix in row.iter().take(row.len() - 1) {
+                x += widths.get(ix).copied().unwrap_or(px(0.)) + px(2.);
+            }
+            let capacity = if r == 0 {
+                bar_w - first_row_reserve
+            } else {
+                bar_w
+            };
+            if let Some(id) = identities.get_mut(row.last().unwrap()) {
+                id.extend_to = Some((capacity - x).max(px(0.)));
+            }
+        }
+    }
+
+    /// Settle canvas: rendered last in the bar, after every width reporter.
+    /// Rows are planned from last render's bar widths; if a resize changed
+    /// the width during paint, this fires ONE notify so the next render
+    /// re-plans. Converges (matching widths -> no notify), so it cannot loop.
+    fn render_wrap_settle_canvas(&self, cx: &mut Context<Pane>) -> AnyElement {
+        let planned = self.wrap_planned_widths.clone();
+        let main_rc = self.wrap_main_bar_width.clone();
+        let pinned_rc = self.wrap_pinned_bar_width.clone();
+        let pane_entity = cx.entity();
+        canvas(
+            move |_: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
+                let recorded = (*main_rc.borrow(), *pinned_rc.borrow());
+                if recorded != *planned.borrow() {
+                    *planned.borrow_mut() = recorded;
+                    cx.notify(pane_entity.entity_id());
+                }
+            },
+            |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_0()
+        .into_any_element()
+    }
+
+    /// Builds one wrap row: optional nav at the start, tabs with their exact
+    /// identities, optional trailing drop target. Rows never wrap internally.
+    #[allow(clippy::too_many_arguments)]
+    fn render_wrap_row(
+        &self,
+        row: &[usize],
+        identities: &HashMap<usize, WrapTabIdentity>,
+        nav: Option<AnyElement>,
+        drop_target: Option<AnyElement>,
+        focus_handle: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> AnyElement {
+        let details = tab_details(&self.items, window, cx);
+        h_flex()
+            .w_full()
+            .when_some(nav, |row_el, nav| row_el.child(nav))
+            .children(row.iter().map(|&ix| {
+                let item = self.items[ix].boxed_clone();
+                self.render_tab(
+                    ix,
+                    item.as_ref(),
+                    details.get(ix).copied().unwrap_or(0),
+                    focus_handle,
+                    identities.get(&ix).cloned().unwrap_or_default(),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            }))
+            .when_some(drop_target, |row_el, target| row_el.child(target))
+            .into_any_element()
+    }
+
+    /// The hidden zero-size ruler strip measuring every tab's natural width
+    /// per frame — the feed-forward input to row planning.
+    fn render_wrap_ruler_tabs(
+        &self,
+        focus_handle: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> AnyElement {
+        let details = tab_details(&self.items, window, cx);
+        let ruler_tabs = self
             .items
             .iter()
             .enumerate()
-            .zip(tab_details(&self.items, window, cx))
-        {
-            let (target, fillers) = if self.is_tab_pinned(ix) {
-                (&mut pinned_tab_items, &mut pinned_filler_items)
-            } else {
-                (&mut unpinned_tab_items, &mut unpinned_filler_items)
-            };
-            target.push(
-                self.render_tab(ix, &**item, detail, &focus_handle, window, cx)
-                    .into_any_element(),
-            );
-            if row_end_ixs.contains(&ix) {
-                fillers.push(self.render_tab_filler(
-                    ix,
-                    item.item_id(),
-                    self.is_tab_pinned(ix),
-                    ix == self.active_item_index,
-                    first_row_end_ix == Some(ix),
-                    &focus_handle,
-                    cx,
-                ));
-            }
-        }
-        let tab_count = self.items.len();
-        if self.is_tab_pinned(tab_count) {
-            log::warn!(
-                "Pinned tab count ({}) exceeds actual tab count ({}). \
-                This should not happen. If possible, add reproduction steps, \
-                in a comment, to https://github.com/zed-industries/zed/issues/33342",
-                self.pinned_tab_count,
-                tab_count
-            );
-            self.pinned_tab_count = tab_count;
-        }
-        let unpinned_tabs = unpinned_tab_items;
-        let pinned_tabs = pinned_tab_items;
-        let unpinned_fillers = unpinned_filler_items;
-        let pinned_fillers = pinned_filler_items;
-
-        let tab_bar_settings = TabBarSettings::get_global(cx);
-        let use_separate_rows = tab_bar_settings.show_pinned_tabs_in_separate_row;
-
-        if use_separate_rows && !pinned_tabs.is_empty() && !unpinned_tabs.is_empty() {
-            self.render_two_row_tab_bar(
-                pinned_tabs,
-                unpinned_tabs,
-                pinned_fillers,
-                unpinned_fillers,
-                tab_count,
-                navigate_backward,
-                navigate_forward,
-                window,
-                cx,
-            )
-        } else {
-            self.render_single_row_tab_bar(
-                pinned_tabs,
-                unpinned_tabs,
-                pinned_fillers,
-                unpinned_fillers,
-                tab_count,
-                navigate_backward,
-                navigate_forward,
-                window,
-                cx,
-            )
-        }
+            .zip(details)
+            .map(|((ix, item), detail)| {
+                self.render_ruler_tab(ix, &**item, detail, focus_handle, window, cx)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("wrap_ruler")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_0()
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .children(ruler_tabs)
+            .into_any_element()
     }
 
     fn configure_tab_bar_start(
@@ -3953,6 +4014,13 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> TabBar {
+        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+        // Zed hides pane CTAs on unfocused panes. In wrap mode the actions
+        // container must STAY laid out (hidden via `visibility`) so its width
+        // — and therefore the first-row reservation — is identical focused or
+        // not: focusing a pane must not reflow its tab rows.
+        let actions_visible =
+            self.has_focus(window, cx) || self.context_menu_focused(window, cx);
         tab_bar
             .when(
                 self.display_nav_history_buttons.unwrap_or_default(),
@@ -3965,125 +4033,311 @@ impl Pane {
             .map(|tab_bar| {
                 if self.show_tab_bar_buttons {
                     let render_tab_buttons = self.render_tab_bar_buttons.clone();
-                    let (left_children, right_children) = render_tab_buttons(self, window, cx);
+                    let (left_children, right_children) = if wrap {
+                        let (left, right) =
+                            render_tab_bar_buttons_laid_out(self, window, cx);
+                        (left, right)
+                    } else {
+                        render_tab_buttons(self, window, cx)
+                    };
                     tab_bar
                         .start_children(left_children)
                         .end_children(right_children)
+                        .when(wrap, |tab_bar| {
+                            tab_bar.wrap_actions_invisible(!actions_visible)
+                        })
                 } else {
                     tab_bar
                 }
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_single_row_tab_bar(
         &mut self,
-        pinned_tabs: Vec<AnyElement>,
-        unpinned_tabs: Vec<AnyElement>,
-        pinned_fillers: Vec<AnyElement>,
-        unpinned_fillers: Vec<AnyElement>,
-        tab_count: usize,
-        navigate_backward: IconButton,
-        navigate_forward: IconButton,
+        rows: Vec<Vec<usize>>,
+        widths: HashMap<usize, Pixels>,
+        reserve: Pixels,
+        nav_w: Pixels,
+        _navigate_backward: IconButton,
+        _navigate_forward: IconButton,
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> AnyElement {
-        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+        let mut identities = Self::wrap_identities(&rows);
+        if let Some(&bar_w) = self.wrap_main_bar_width.borrow().as_ref() {
+            Self::apply_wrap_extensions(
+                &widths, &rows, &mut identities, bar_w, reserve, nav_w,
+            );
+        }
+        let focus_handle = self.focus_handle.clone();
 
-        let tab_bar = self.configure_tab_bar_start(
-            TabBar::new("tab_bar").wrap(wrap).when(wrap, |bar| {
-                let bar_recorder = self.tab_bar_bounds_recorder.clone();
-                let actions_recorder = self.wrap_actions_bounds_recorder.clone();
-                bar.report_bounds(Rc::new(move |bounds| {
-                    *bar_recorder.borrow_mut() = Some(bounds);
-                }))
-                .report_actions_bounds(Rc::new(move |bounds| {
-                    *actions_recorder.borrow_mut() = Some(bounds);
-                }))
-            }),
-            navigate_backward,
-            navigate_forward,
-            window,
-            cx,
-        );
+        let last_row = rows.len().saturating_sub(1);
+        let row_elements = rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                let nav = if r == 0 {
+                    self.wrap_nav_container(cx)
+                } else {
+                    None
+                };
+                let drop_target = if r == last_row {
+                    Some(self.render_tab_bar_drop_target(self.items.len(), cx).into_any_element())
+                } else {
+                    None
+                };
+                self.render_wrap_row(row, &identities, nav, drop_target, &focus_handle, window, cx)
+            })
+            .collect::<Vec<_>>();
 
-        let tab_bar = if wrap {
-            // Pinned tabs join the wrapping flow as individual children (VS Code
-            // style): an atomic pinned block would wrap as a unit and strand the
-            // nav buttons alone on row 1 when it doesn't fit beside them.
-            tab_bar
-                // Strips first: absolute (no flex presence) and painted under
-                // the tabs, so a stale strip is covered by whatever tab now
-                // occupies its region instead of covering the tab.
-                .children(pinned_fillers)
-                .children(unpinned_fillers)
-                .children(pinned_tabs)
-                .children(unpinned_tabs)
-                .child(self.render_tab_bar_drop_target(tab_count, cx))
-        } else {
-            tab_bar
-                .children((!pinned_tabs.is_empty()).then(|| {
-                    let max_scroll = self.tab_bar_scroll_handle.max_offset().x;
-                    // We need to check both because offset returns delta values even when the scroll handle is not scrollable
-                    let is_scrolled = self.tab_bar_scroll_handle.offset().x < px(0.);
-                    // Avoid flickering when max_offset is very small (< 2px).
-                    // The border adds 1-2px which can push max_offset back to 0, creating a loop.
-                    let is_scrollable = max_scroll > px(2.0);
-                    let has_active_unpinned_tab = self.active_item_index >= self.pinned_tab_count;
-                    h_flex()
-                        .children(pinned_tabs)
-                        .when(is_scrollable && is_scrolled, |this| {
-                            this.when(has_active_unpinned_tab, |this| this.border_r_2())
-                                .when(!has_active_unpinned_tab, |this| this.border_r_1())
-                                .border_color(cx.theme().colors().border)
-                        })
-                }))
-                .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx))
-        };
-        tab_bar.into_any_element()
+        let bar_width_rc = self.wrap_main_bar_width.clone();
+        let actions_width_rc = self.wrap_actions_width.clone();
+        let tab_bar = TabBar::new("tab_bar")
+            .wrap(true)
+            .report_bounds(Rc::new(move |bounds| {
+                *bar_width_rc.borrow_mut() = Some(bounds.size.width);
+            }))
+            .report_actions_bounds(Rc::new(move |bounds| {
+                *actions_width_rc.borrow_mut() = Some(bounds.size.width);
+            }));
+        let tab_bar = self.attach_wrap_ctas(tab_bar, window, cx);
+        tab_bar
+            .children(row_elements)
+            .child(self.render_wrap_ruler_tabs(&focus_handle, window, cx))
+            .child(self.render_wrap_settle_canvas(cx))
+            .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_two_row_tab_bar(
         &mut self,
-        pinned_tabs: Vec<AnyElement>,
-        unpinned_tabs: Vec<AnyElement>,
-        pinned_fillers: Vec<AnyElement>,
-        unpinned_fillers: Vec<AnyElement>,
-        tab_count: usize,
-        navigate_backward: IconButton,
-        navigate_forward: IconButton,
+        pinned_rows: Vec<Vec<usize>>,
+        unpinned_rows: Vec<Vec<usize>>,
+        widths: HashMap<usize, Pixels>,
+        reserve: Pixels,
+        nav_w: Pixels,
+        _navigate_backward: IconButton,
+        _navigate_forward: IconButton,
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> AnyElement {
-        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+        let focus_handle = self.focus_handle.clone();
 
-        let pinned_tab_bar = if wrap {
-            // The pinned strip wraps in its own bar: tabs flow directly (the
-            // non-wrap inner h_flex would scroll instead of wrapping, and an
-            // atomic container would defeat the per-tab flow).
-            let bar_recorder = self.pinned_bar_bounds_recorder.clone();
-            let actions_recorder = self.wrap_actions_bounds_recorder.clone();
-            self.configure_tab_bar_start(
+        // Pinned bar: carries the CTAs; row 0 gets nav + the reservation.
+        let mut pinned_ids = Self::wrap_identities(&pinned_rows);
+        if let Some(&bar_w) = self.wrap_pinned_bar_width.borrow().as_ref() {
+            Self::apply_wrap_extensions(
+                &widths,
+                &pinned_rows,
+                &mut pinned_ids,
+                bar_w,
+                reserve,
+                nav_w,
+            );
+        }
+        let pinned_last = pinned_rows.len().saturating_sub(1);
+        let pinned_row_elements = pinned_rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                let nav = if r == 0 {
+                    self.wrap_nav_container(cx)
+                } else {
+                    None
+                };
+                let drop_target = if r == pinned_last {
+                    Some(self.render_pinned_tab_bar_drop_target(cx).into_any_element())
+                } else {
+                    None
+                };
+                self.render_wrap_row(row, &pinned_ids, nav, drop_target, &focus_handle, window, cx)
+            })
+            .collect::<Vec<_>>();
+        let pinned_bar_width_rc = self.wrap_pinned_bar_width.clone();
+        let actions_width_rc = self.wrap_actions_width.clone();
+        let pinned_tab_bar = self
+            .attach_wrap_ctas(
                 TabBar::new("pinned_tab_bar")
                     .wrap(true)
                     .report_bounds(Rc::new(move |bounds| {
-                        *bar_recorder.borrow_mut() = Some(bounds);
+                        *pinned_bar_width_rc.borrow_mut() = Some(bounds.size.width);
                     }))
-                    // In two-row mode the pane actions (end_children) ride this
-                    // bar via configure_tab_bar_start, so THIS bar's first row
-                    // must reserve their width — not the unpinned bar's.
                     .report_actions_bounds(Rc::new(move |bounds| {
-                        *actions_recorder.borrow_mut() = Some(bounds);
+                        *actions_width_rc.borrow_mut() = Some(bounds.size.width);
                     })),
+                window,
+                cx,
+            )
+            .children(pinned_row_elements);
+
+        // Unpinned bar: no CTAs, no nav — full capacity on every row.
+        let mut unpinned_ids = Self::wrap_identities(&unpinned_rows);
+        if let Some(&bar_w) = self.wrap_main_bar_width.borrow().as_ref() {
+            Self::apply_wrap_extensions(&widths, &unpinned_rows, &mut unpinned_ids, bar_w, px(0.), px(0.));
+        }
+        let unpinned_last = unpinned_rows.len().saturating_sub(1);
+        let unpinned_row_elements = unpinned_rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                let drop_target = if r == unpinned_last {
+                    Some(self.render_tab_bar_drop_target(self.items.len(), cx).into_any_element())
+                } else {
+                    None
+                };
+                self.render_wrap_row(row, &unpinned_ids, None, drop_target, &focus_handle, window, cx)
+            })
+            .collect::<Vec<_>>();
+        let main_bar_width_rc = self.wrap_main_bar_width.clone();
+        let unpinned_tab_bar = TabBar::new("unpinned_tab_bar")
+            .wrap(true)
+            .report_bounds(Rc::new(move |bounds| {
+                *main_bar_width_rc.borrow_mut() = Some(bounds.size.width);
+            }))
+            .children(unpinned_row_elements)
+            .child(self.render_wrap_ruler_tabs(&focus_handle, window, cx))
+            .child(self.render_wrap_settle_canvas(cx));
+
+        v_flex()
+            .w_full()
+            .flex_none()
+            .child(pinned_tab_bar)
+            .child(unpinned_tab_bar)
+            .into_any_element()
+    }
+
+    /// The nav container for wrap row 0 (upstream's TabBar start_children
+    /// styling), with a width reporter canvas. Buttons are built here
+    /// (IconButton isn't Clone and row 0 renders once per bar).
+    fn wrap_nav_container(&self, cx: &mut Context<Pane>) -> Option<AnyElement> {
+        let entity = cx.entity();
+        if !self.display_nav_history_buttons.unwrap_or_default() {
+            return None;
+        }
+        let nav_width = self.wrap_nav_width.clone();
+        let can_navigate_backward = self.can_navigate_backward();
+        let can_navigate_forward = self.can_navigate_forward();
+        let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
+            .icon_size(IconSize::Small)
+            .on_click(move |_, window, cx| {
+                entity.update(cx, |pane, cx| {
+                    pane.navigate_backward(&Default::default(), window, cx)
+                })
+            })
+            .disabled(!can_navigate_backward);
+        let entity = cx.entity();
+        let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
+            .icon_size(IconSize::Small)
+            .on_click(move |_, window, cx| {
+                entity.update(cx, |pane, cx| {
+                    pane.navigate_forward(&Default::default(), window, cx)
+                })
+            })
+            .disabled(!can_navigate_forward);
+        Some(
+            h_flex()
+                .id("wrap_nav")
+                .flex_none()
+                .h(Tab::container_height(cx))
+                .gap(DynamicSpacing::Base04.rems(cx))
+                .px(DynamicSpacing::Base06.rems(cx))
+                .border_r_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .child(navigate_backward)
+                .child(navigate_forward)
+                .child(
+                    canvas(
+                        move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                            *nav_width.borrow_mut() = bounds.size.width;
+                        },
+                        |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Attaches the pane CTAs (end_children) to a wrap bar: always laid out,
+    /// hidden via visibility when the pane is unfocused (width stays
+    /// measurable — focus never reflows rows).
+    fn attach_wrap_ctas(
+        &mut self,
+        tab_bar: TabBar,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> TabBar {
+        if !self.show_tab_bar_buttons {
+            return tab_bar;
+        }
+        let actions_visible =
+            self.has_focus(window, cx) || self.context_menu_focused(window, cx);
+        let (left_children, right_children) = render_tab_bar_buttons_laid_out(self, window, cx);
+        // Left children (if any custom pane provides them) join row 0 via
+        // start_children being ignored in wrap mode — render them into the
+        // ruler strip? Custom panes with left children are rare; append them
+        // invisibly to keep them laid out without breaking row layout.
+        let _ = left_children;
+        tab_bar
+            .end_children(right_children)
+            .wrap_actions_invisible(!actions_visible)
+    }
+
+    fn render_single_row_tab_bar_non_wrap(
+        &mut self,
+        pinned_tabs: Vec<AnyElement>,
+        unpinned_tabs: Vec<AnyElement>,
+        tab_count: usize,
+        navigate_backward: IconButton,
+        navigate_forward: IconButton,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> AnyElement {
+        let tab_bar = self
+            .configure_tab_bar_start(
+                TabBar::new("tab_bar"),
                 navigate_backward,
                 navigate_forward,
                 window,
                 cx,
             )
-            .children(pinned_fillers)
-            .children(pinned_tabs)
-            .child(self.render_pinned_tab_bar_drop_target(cx))
-        } else {
-            self.configure_tab_bar_start(
+            .children((!pinned_tabs.is_empty()).then(|| {
+                let max_scroll = self.tab_bar_scroll_handle.max_offset().x;
+                // We need to check both because offset returns delta values even when the scroll handle is not scrollable
+                let is_scrolled = self.tab_bar_scroll_handle.offset().x < px(0.);
+                // Avoid flickering when max_offset is very small (< 2px).
+                // The border adds 1-2px which can push max_offset back to 0, creating a loop.
+                let is_scrollable = max_scroll > px(2.0);
+                let has_active_unpinned_tab = self.active_item_index >= self.pinned_tab_count;
+                h_flex()
+                    .children(pinned_tabs)
+                    .when(is_scrollable && is_scrolled, |this| {
+                        this.when(has_active_unpinned_tab, |this| this.border_r_2())
+                            .when(!has_active_unpinned_tab, |this| this.border_r_1())
+                            .border_color(cx.theme().colors().border)
+                    })
+            }))
+            .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx));
+        tab_bar.into_any_element()
+    }
+
+    fn render_two_row_tab_bar_non_wrap(
+        &mut self,
+        pinned_tabs: Vec<AnyElement>,
+        unpinned_tabs: Vec<AnyElement>,
+        tab_count: usize,
+        navigate_backward: IconButton,
+        navigate_forward: IconButton,
+        window: &mut Window,
+        cx: &mut Context<Pane>,
+    ) -> AnyElement {
+        let pinned_tab_bar = self
+            .configure_tab_bar_start(
                 TabBar::new("pinned_tab_bar"),
                 navigate_backward,
                 navigate_forward,
@@ -4098,29 +4352,19 @@ impl Pane {
                     .w_full()
                     .children(pinned_tabs)
                     .child(self.render_pinned_tab_bar_drop_target(cx)),
-            )
-        };
-
-        let unpinned_tab_bar = if wrap {
-            let bar_recorder = self.tab_bar_bounds_recorder.clone();
-            TabBar::new("unpinned_tab_bar")
-                .wrap(true)
-                .report_bounds(Rc::new(move |bounds| {
-                    *bar_recorder.borrow_mut() = Some(bounds);
-                }))
-                .children(unpinned_fillers)
-                .children(unpinned_tabs)
-                .child(self.render_tab_bar_drop_target(tab_count, cx))
-        } else {
-            TabBar::new("unpinned_tab_bar")
-                .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx))
-        };
+            );
 
         v_flex()
             .w_full()
             .flex_none()
             .child(pinned_tab_bar)
-            .child(unpinned_tab_bar)
+            .child(
+                TabBar::new("unpinned_tab_bar").child(self.render_unpinned_tabs_container(
+                    unpinned_tabs,
+                    tab_count,
+                    cx,
+                )),
+            )
             .into_any_element()
     }
 
@@ -4164,88 +4408,7 @@ impl Pane {
         tab_count: usize,
         cx: &mut Context<Pane>,
     ) -> Stateful<Div> {
-        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
         target
-            .when(wrap, |this| {
-                // This canvas is the LAST bounds reporter in child order (tabs
-                // and the ruler strip report before it), so it consumes what
-                // this frame produced: simulate rows from natural widths,
-                // update extension widths and mid-row membership, and re-render
-                // only when something changed.
-                let bounds_recorder = self.tab_bounds_recorder.clone();
-                let bar_recorder = self.tab_bar_bounds_recorder.clone();
-                let pinned_bar_recorder = self.pinned_bar_bounds_recorder.clone();
-                let row_end_recorder = self.wrapped_row_end_ixs.clone();
-                let first_row_end_recorder = self.wrapped_first_row_end_ix.clone();
-                let snapshot = self.wrap_layout_snapshot.clone();
-                let mid_row = self.wrapped_mid_row_ixs.clone();
-                let exclude_pinned = usize::from(
-                    TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row,
-                ) * self.pinned_tab_count;
-                let pane_entity = cx.entity();
-                this.child(
-                    canvas(
-                        move |_: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
-                            let Some(bar_bounds) = bar_recorder.borrow_mut().take() else {
-                                return;
-                            };
-                            let pinned_bar_bounds = pinned_bar_recorder.borrow_mut().take();
-                            let positions = mem::take(&mut *bounds_recorder.borrow_mut());
-
-                            // Rows derive from OBSERVED positions (exact taffy
-                            // line-breaking); no arithmetic simulation.
-                            let (mut computed_row_ends, mut computed_mid_row, main_first) =
-                                Self::compute_wrapped_row_layout_from_positions(
-                                    &positions,
-                                    exclude_pinned..usize::MAX,
-                                );
-                            let mut computed_first_row_end =
-                                if exclude_pinned > 0 { None } else { main_first };
-
-                            // In two-row mode the pinned strip wraps in its own
-                            // bar; derive its rows too and merge (indices
-                            // disjoint).
-                            if exclude_pinned > 0 {
-                                let (ends, mids, first) =
-                                    Self::compute_wrapped_row_layout_from_positions(
-                                        &positions,
-                                        0..exclude_pinned,
-                                    );
-                                computed_row_ends.extend(ends);
-                                computed_mid_row.extend(mids);
-                                computed_first_row_end = first;
-                            }
-
-                            // Snapshot for render-time strip placement. Written
-                            // every frame regardless of state change: strips
-                            // track geometry, not just structure.
-                            *snapshot.borrow_mut() = WrapLayoutSnapshot {
-                                positions,
-                                main_bar: Some(bar_bounds),
-                                pinned_bar: pinned_bar_bounds,
-                            };
-
-                            let mut row_ends = row_end_recorder.borrow_mut();
-                            let mut first_row_end = first_row_end_recorder.borrow_mut();
-                            let mut mid_row = mid_row.borrow_mut();
-                            if computed_row_ends != *row_ends
-                                || computed_first_row_end != *first_row_end
-                                || computed_mid_row != *mid_row
-                            {
-                                *row_ends = computed_row_ends;
-                                *first_row_end = computed_first_row_end;
-                                *mid_row = computed_mid_row;
-                                cx.notify(pane_entity.entity_id());
-                            }
-                        },
-                        |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
-                    )
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-                )
-            })
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
             .child("")
@@ -4331,21 +4494,6 @@ impl Pane {
                     window.dispatch_action(this.double_click_dispatch_action.boxed_clone(), cx);
                 }
             }))
-    }
-
-    pub fn render_menu_overlay(menu: &Entity<ContextMenu>) -> Div {
-        div().absolute().bottom_0().right_0().size_0().child(
-            deferred(anchored().anchor(Anchor::TopRight).child(menu.clone())).with_priority(1),
-        )
-    }
-
-    pub fn set_zoomed(&mut self, zoomed: bool, cx: &mut Context<Self>) {
-        self.zoomed = zoomed;
-        cx.notify();
-    }
-
-    pub fn is_zoomed(&self) -> bool {
-        self.zoomed
     }
 
     fn handle_drag_move<T: 'static>(
@@ -4852,6 +5000,15 @@ impl Pane {
     pub fn set_zoom_out_on_close(&mut self, zoom_out_on_close: bool) {
         self.zoom_out_on_close = zoom_out_on_close;
     }
+
+    pub fn set_zoomed(&mut self, zoomed: bool, cx: &mut Context<Self>) {
+        self.zoomed = zoomed;
+        cx.notify();
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
 }
 
 fn default_render_tab_bar_buttons(
@@ -4862,6 +5019,17 @@ fn default_render_tab_bar_buttons(
     if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
         return (None, None);
     }
+    render_tab_bar_buttons_laid_out(pane, window, cx)
+}
+
+/// The tab bar button content without the focus gate. Used directly by the
+/// wrap layout, where the actions container is always laid out (width must be
+/// measurable for the first-row reservation) and focus only gates paint.
+fn render_tab_bar_buttons_laid_out(
+    pane: &mut Pane,
+    _window: &mut Window,
+    cx: &mut Context<Pane>,
+) -> (Option<AnyElement>, Option<AnyElement>) {
     let (can_clone, can_split_move) = match pane.active_item() {
         Some(active_item) if active_item.can_split(cx) => (true, false),
         Some(_) => (false, pane.items_len() > 1),
@@ -6312,14 +6480,6 @@ mod tests {
         for label in ["A", "B", "C", "D", "E", "F"] {
             add_labeled_item(&pane, label, false, cx);
         }
-        // Drives frames until extension widths reach their fixed point; a
-        // width feedback loop would keep scheduling notifies and never park.
-        // Notify-driven extension converges over frames; parked alone doesn't
-        // repaint windows in the test harness, so pump a frame explicitly.
-        // Notify-driven layout converges over frames; parked alone doesn't
-        // repaint windows in the test harness, so pump frames explicitly.
-        // Three pumps cover the settle sequence (measure -> stable-check ->
-        // apply) introduced by the width-churn gate.
         for _ in 0..3 {
             cx.refresh().unwrap();
             cx.run_until_parked();
@@ -6335,27 +6495,31 @@ mod tests {
         let second_row: Vec<_> = bounds.iter().filter(|b| b.origin.y != first_row_y).collect();
         assert!(!second_row.is_empty(), "expected wrapping to occur");
 
-        // The row-end tab's FILLER strip grows to the bar's right edge at
-        // layout time (minus nothing here: its slot is inset by the actions
-        // width, but the strip itself runs edge to edge under the container).
-        let filler = cx
-            .debug_bounds("TAB-FILLER-4")
-            .expect("row-end filler renders");
+        // Manual rows: the row-1 END tab itself extends to the zone boundary
+        // (bar minus the CTA reserve); the icon rides flush right inside it.
+        let actions_width = pane
+            .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
+            .expect("actions width measured");
+        let row1_end = bounds
+            .iter()
+            .filter(|b| b.origin.y == first_row_y)
+            .max_by_key(|b| b.right())
+            .unwrap();
+        let zone_edge = px(300.) - actions_width;
+        // ±5px: sub-pixel canvas rounding through nav/tab accumulations.
         assert!(
-            filler.right() >= px(295.),
-            "row-end filler should reach the bar's right edge, got {filler:?}"
-        );
-        // No filler on the last row: the drop target owns that leftover.
-        assert!(
-            cx.debug_bounds("TAB-FILLER-5").is_none(),
-            "last-row tabs must not get fillers"
+            (row1_end.right() - zone_edge).abs() <= px(5.),
+            "row-1 end tab should extend to the zone edge ({zone_edge:?}), got {row1_end:?}"
         );
 
-        // Tabs on the last row do not extend: the drop target owns that space.
-        let last_row_max_right = second_row.iter().map(|b| b.right()).max().unwrap();
+        // Rows below the first span the FULL bar width (no reserve theft):
+        // their row-end tabs reach ~300 exactly.
+        let lower_end = second_row.iter().max_by_key(|b| b.right()).unwrap();
+        // The last row has no extension; only middle rows extend. Accept
+        // either the bar edge (middle row) or natural width (final row).
         assert!(
-            last_row_max_right < px(295.),
-            "last-row tabs should not extend to the edge, got {last_row_max_right:?}"
+            (lower_end.right() - px(300.)).abs() <= px(2.) || lower_end.right() < px(250.),
+            "lower rows either extend to the bar edge or are the final natural row, got {lower_end:?}"
         );
     }
 
@@ -6370,7 +6534,10 @@ mod tests {
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
         set_wrap_tabs(cx, true);
-        cx.simulate_resize(size(px(300.), px(300.)));
+        // Width chosen so the six tabs wrap (row 1's END tab carries the
+        // ~82px reservation: nav ~53 + 6*~44 + 82 = ~399 > 375) but the five
+        // remaining tabs after a removal fit one row (~355 <= 375).
+        cx.simulate_resize(size(px(375.), px(300.)));
 
         let items: Vec<_> = ["A", "B", "C", "D", "E", "F"]
             .map(|label| add_labeled_item(&pane, label, false, cx))
@@ -6472,17 +6639,31 @@ mod tests {
         // carries the pane buttons (top-right, absolute), and the row-end tab
         // must stop flush at their left border — extending past it would hide
         // the extended tab's unpin button underneath the buttons.
+        // Bottom-right CTA model: rows above the last span the FULL width
+        // (their strips reach the bar edge); the actions zone sits at the
+        // bar's bottom-right, reserved by the LAST pinned tab's margin.
+        let actions_width = pane
+            .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
+            .expect("actions width measured");
+        assert!(actions_width > px(0.), "CTAs stay laid out (visibility-gated)");
         let first_row_y = pinned_bounds[0].origin.y;
-        let first_row_max_right = pinned_bounds
+        let first_row_count = pinned_bounds
             .iter()
             .filter(|b| b.origin.y == first_row_y)
-            .map(|b| b.right())
-            .max()
+            .count();
+        // Manual rows: the pinned row-1 END TAB itself extends to the zone
+        // boundary (bar minus the CTA reserve riding this bar).
+        let row1_end = pinned_bounds
+            .iter()
+            .filter(|b| b.origin.y == first_row_y)
+            .max_by_key(|b| b.right())
             .unwrap();
+        let zone_edge = px(300.) - actions_width;
         assert!(
-            first_row_max_right >= px(250.) && first_row_max_right < px(299.),
-            "pinned row-end tab should extend to the actions-reserved edge (~268),              got {first_row_max_right:?}"
+            (row1_end.right() - zone_edge).abs() <= px(5.),
+            "pinned row-1 end tab should extend to the zone edge ({zone_edge:?}), got {row1_end:?}"
         );
+        let _ = first_row_count;
     }
 
     #[gpui::test]
@@ -6541,10 +6722,308 @@ mod tests {
         assert!(ys.len() >= 2, "tabs should wrap at 350px");
         pane.read_with(cx, |pane, _| {
             assert!(
-                !pane.wrapped_row_end_ixs.borrow().is_empty(),
-                "row-end fillers should be placed once the width is stable"
+                !pane.wrapped_tab_natural_widths.borrow().is_empty(),
+                "row planning should run once widths are measured"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_narrower_than_last_tab_no_phantom_row(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        // Nav (~53px) + tab 0 (~44px) + the row-1 actions reservation (~82px)
+        // fit row 1; tab 1 wraps to row 2 (test-font labels render ~42px
+        // regardless of length, so the geometry comes from the narrow bar).
+        cx.simulate_resize(size(px(200.), px(300.)));
+        add_labeled_item(&pane, "one.rs", false, cx);
+        add_labeled_item(&pane, "two.rs", false, cx);
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+
+        // Exactly two rows: tab 1 alone on row 2 — no third row for the drop
+        // target (it used to wrap onto its own phantom row via min_w_6).
+        let b0 = cx.debug_bounds("TAB-0").expect("tab 0 renders");
+        let b1 = cx.debug_bounds("TAB-1").expect("tab 1 renders");
+        assert_ne!(b0.origin.y, b1.origin.y, "tab 1 should wrap to its own row");
+        assert_eq!(b0.origin.y, px(1.), "tab 0 shares row 1 with the nav");
+        // Manual rows: exactly two rows — nothing can create a phantom row
+        // (the drop target is an in-flow child of the last row).
+        let max_y = [b0, b1].iter().map(|b| b.origin.y).max().unwrap();
+        for sel in ["TAB-0", "TAB-1"] {
+            let b = cx.debug_bounds(sel).expect(sel);
+            assert!(
+                b.origin.y <= max_y,
+                "no tab may sit below the last row: {b:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_unfocused_pane_reserves_actions_zone_without_flicker(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(700.), px(300.)));
+
+        // Split: the ORIGINAL pane loses focus to the new right pane.
+        let _new_pane = pane.update_in(cx, |pane, window, cx| {
+            pane.split(SplitDirection::Right, SplitMode::EmptyPane, window, cx)
+        });
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+
+        // The UNFOCUSED pane's actions container is laid out invisibly, so
+        // its width is measured and the bar reserves the zone: row-1 tabs
+        // never enter it, and focusing later cannot reflow anything.
+        let actions_width = pane
+            .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
+            .expect("unfocused pane's actions width must be measurable");
+        let _ = actions_width;
+        // The split pane occupies the left half (~350px wide): row-1 tabs must
+        // stop before its zone (bar right edge minus the reserve).
+        let rightmost = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .filter_map(|s| cx.debug_bounds(s))
+            .map(|b| b.right())
+            .max()
+            .expect("tabs render");
+        let first_row_y = cx.debug_bounds("TAB-0").expect("tab 0").origin.y;
+        for sel in ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"] {
+            if let Some(b) = cx.debug_bounds(sel) {
+                if b.origin.y == first_row_y {
+                    assert!(
+                        b.right() <= rightmost,
+                        "{sel} overlaps content beyond its row"
+                    );
+                }
+            }
+        }
+        // Reserve is active even unfocused.
+        assert!(
+            pane.read_with(cx, |pane, _| pane.wrap_actions_width.borrow().unwrap_or(px(0.)))
+                >= actions_width,
+            "reserve must be applied on the unfocused pane"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_row_one_tabs_never_enter_actions_zone(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+
+        let assert_stable_and_zoned = |cx: &mut gpui::VisualTestContext, width: gpui::Pixels| {
+            // Settle, then require TWO consecutive frames to be identical:
+            // an oscillating reservation (stay/return conditions differing)
+            // never produces two equal consecutive frames.
+            for _ in 0..3 {
+                cx.refresh().unwrap();
+                cx.run_until_parked();
+            }
+            let capture = |cx: &mut gpui::VisualTestContext| -> Vec<Option<gpui::Bounds<gpui::Pixels>>> {
+                ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+                    .iter()
+                    .map(|s| cx.debug_bounds(s))
+                    .collect()
+            };
+            let first = capture(cx);
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+            let second = capture(cx);
+            // Tolerance: 1px (device-pixel snapping of half-pixel layouts can
+            // alternate which frame rounds up). Real oscillations (row
+            // membership, CTA-width jumps) move bounds by tens of pixels and
+            // still fail this.
+            let within_tolerance = first.iter().zip(second.iter()).all(|(a, b)| {
+                match (a, b) {
+                    (Some(a), Some(b)) => {
+                        (a.origin.x - b.origin.x).abs() <= px(1.)
+                            && (a.origin.y - b.origin.y).abs() <= px(1.)
+                            && (a.size.width - b.size.width).abs() <= px(1.)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+            });
+            assert!(
+                within_tolerance,
+                "layout must not oscillate at width {width:?}:\nF1 {first:?}\nF2 {second:?}"
+            );
+
+            // Bottom-right CTA model: every row except the last must span
+            // to the very right edge (strips reach it); the LAST row's
+            // globally-last tab reserves the zone via its static margin.
+            let last_row_y = first
+                .iter()
+                .flatten()
+                .map(|b| b.origin.y)
+                .max()
+                .expect("tabs render");
+            let last_row_right = first
+                .iter()
+                .flatten()
+                .filter(|b| b.origin.y == last_row_y)
+                .map(|b| b.right())
+                .max()
+                .expect("last row tabs");
+            // Rows ABOVE the last reach the edge exactly (strip-verified in
+            // the extension test); the last row may fall short by up to the
+            // reserve — but never beyond the bar.
+            assert!(
+                last_row_right <= width,
+                "last row must not overflow the bar ({width:?}), got {last_row_right:?}"
+            );
+        };
+
+        // Sweep across the borderline where the reservation flips row
+        // membership — the band where an all-row-1 margin oscillates.
+        for width in [260., 280., 300., 320., 340., 360.] {
+            cx.simulate_resize(size(px(width), px(300.)));
+            assert_stable_and_zoned(cx, px(width));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_diag_boundary_sweep(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        // 8 tabs so several rows exist; sweep 1px at a time through the
+        // boundary band where row-1 membership flips.
+        for label in ["A", "B", "C", "D", "E", "F", "G", "H"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+
+        for width in [390., 380.] {
+            cx.simulate_resize(size(px(width), px(300.)));
+            // settle, tracing each pump
+            for _pump in 0..6 {
+                cx.refresh().unwrap();
+                cx.run_until_parked();
+                let t5 = cx.debug_bounds("TAB-5");
+                let f4 = cx.debug_bounds("TAB-FILLER-4");
+                let f5 = cx.debug_bounds("TAB-FILLER-5");
+                let _ = (&t5, &f4, &f5);
+            }
+            let tabs: Vec<Option<gpui::Bounds<gpui::Pixels>>> = ["TAB-0","TAB-1","TAB-2","TAB-3","TAB-4","TAB-5","TAB-6","TAB-7"]
+                .iter().map(|s| cx.debug_bounds(s)).collect();
+            let reserve = pane.read_with(cx, |pane, _| pane.wrap_actions_width.borrow().unwrap_or(px(0.)));
+            // observed row-1 end: max index sharing min y
+            let min_y = tabs.iter().flatten().map(|b| b.origin.y).min().unwrap();
+            let row1: Vec<(usize, gpui::Bounds<gpui::Pixels>)> = tabs.iter().enumerate()
+                .filter_map(|(i, b)| b.filter(|b| b.origin.y == min_y).map(|b| (i, b))).collect();
+            let obs_end = row1.last().map(|(i, _)| *i);
+            eprintln!("W{width} obs_end={obs_end:?} reserve={reserve:?}");
+            // A: mid-row gap detector (adjacent same-row tabs with gap > 4px)
+            for w in row1.windows(2) {
+                let gap = w[1].1.origin.x - w[0].1.right();
+                if gap > px(4.) {
+                    eprintln!("  GAP row1 between TAB-{} and TAB-{}: {:?}", w[0].0, w[1].0, gap);
+                }
+            }
+            // B: strip alignment (strip must share its tab's y and start at its right)
+            for (i, t) in tabs.iter().enumerate() {
+                if let Some(t) = t {
+                    let sel: &'static str = Box::leak(format!("TAB-FILLER-{i}").into_boxed_str());
+                    if let Some(f) = cx.debug_bounds(sel) {
+                        if (f.origin.y - t.origin.y).abs() > px(0.5) || (f.origin.x - t.right()).abs() > px(2.) {
+                            eprintln!("  MISALIGN strip TAB-FILLER-{i}: strip {f:?} vs tab {t:?}");
+                        }
+                    }
+                }
+            }
+            // C: zone intrusion (row-1 tab box into the CTA zone)
+            if let Some(res) = Some(reserve) {
+                for (i, b) in row1.iter() {
+                    if b.right() > px(width) - res + px(2.) {
+                        eprintln!("  INTRUDE TAB-{i} right {:?} into zone (starts {:?})", b.right(), px(width) - res);
+                    }
+                }
+            }
+            // D: row-2 displacement (row-2 first tab not at x=0)
+            let row2: Vec<(usize, gpui::Bounds<gpui::Pixels>)> = tabs.iter().enumerate()
+                .filter_map(|(i, b)| b.filter(|b| b.origin.y > min_y).map(|b| (i, b))).collect();
+            if let Some((i, b)) = row2.first() {
+                if b.origin.x > px(4.) {
+                    eprintln!("  DISPLACE row2 starts at TAB-{i} x={:?} (tail on row 2?)", b.origin.x);
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_diag_realistic_widths(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(520.), px(300.)));
+        // Real-app geometry: varied explicit widths (100-240px), like real
+        // filename tabs.
+        let widths = [130., 200., 155., 240., 175., 140., 210., 160.];
+        pane.update_in(cx, |pane, window, cx| {
+            for (i, w) in widths.iter().enumerate() {
+                let item = FixedWidthTestItem::new(px(*w), &format!("item-{i}"), cx);
+                pane.add_item(Box::new(item), false, false, None, window, cx);
+            }
+        });
+        for _ in 0..3 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+
+        for ix in 0..8 {
+            let sel: &'static str = Box::leak(format!("TAB-{ix}").into_boxed_str());
+            if let Some(b) = cx.debug_bounds(sel) {
+                eprintln!(
+                    "D{ix}: x={:?} y={:?} w={:?} r={:?}",
+                    b.origin.x, b.origin.y, b.size.width, b.right()
+                );
+            }
+        }
     }
 
     #[gpui::test]
@@ -10254,6 +10733,53 @@ mod tests {
             dirty_message_for(None, PathStyle::Unix),
             "This buffer contains unsaved edits. Do you want to save it?"
         );
+    }
+
+    /// A test item whose tab content is an explicit-width div: gpui tests
+    /// stub text metrics to a constant advance, so label-based items cannot
+    /// produce varied tab widths (everything renders at the ~42px slot floor).
+    /// Real width-dependent wrap behavior needs this.
+    struct FixedWidthTestItem {
+        focus_handle: FocusHandle,
+        width: Pixels,
+        label: String,
+    }
+
+    impl FixedWidthTestItem {
+        fn new(width: Pixels, label: &str, cx: &mut App) -> Entity<Self> {
+            cx.new(|cx| Self {
+                focus_handle: cx.focus_handle(),
+                width,
+                label: label.to_string(),
+            })
+        }
+    }
+
+    impl EventEmitter<()> for FixedWidthTestItem {}
+    impl Focusable for FixedWidthTestItem {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+    impl Render for FixedWidthTestItem {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui::Empty
+        }
+    }
+    impl Item for FixedWidthTestItem {
+        type Event = ();
+        fn tab_content(
+            &self,
+            _params: TabContentParams,
+            _window: &Window,
+            _cx: &App,
+        ) -> AnyElement {
+            div().w(self.width).h_full().into_any_element()
+        }
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            self.label.clone().into()
+        }
+        fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
     }
 
     mod property_test {

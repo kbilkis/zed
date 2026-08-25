@@ -15,7 +15,12 @@ pub struct TabBar {
     scroll_handle: Option<ScrollHandle>,
     wrap: bool,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
-    actions_width_reporter: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
+    report_actions_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
+    /// Paint gate for the always-laid-out actions container (wrap layout):
+    /// Zed hides pane CTAs on unfocused panes; hiding via `visibility` keeps
+    /// the container (and its width reporter) laid out, so focus changes
+    /// never shift the layout.
+    wrap_actions_invisible: bool,
 }
 
 impl TabBar {
@@ -28,7 +33,8 @@ impl TabBar {
             scroll_handle: None,
             wrap: false,
             report_bounds: None,
-            actions_width_reporter: None,
+            report_actions_bounds: None,
+            wrap_actions_invisible: false,
         }
     }
 
@@ -54,9 +60,19 @@ impl TabBar {
     /// only), so the caller can reserve the first row's right edge and keep
     /// tabs from sliding underneath the top-right buttons.
     pub fn report_actions_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
-        self.actions_width_reporter = Some(report);
+        self.report_actions_bounds = Some(report);
         self
     }
+
+    /// Hides the wrap-mode actions container from paint while keeping it laid
+    /// out (used when the pane is unfocused; Zed gates pane CTAs on focus).
+    pub fn wrap_actions_invisible(mut self, invisible: bool) -> Self {
+        self.wrap_actions_invisible = invisible;
+        self
+    }
+
+
+
 
     pub fn start_children_mut(&mut self) -> &mut SmallVec<[AnyElement; 2]> {
         &mut self.start_children
@@ -124,21 +140,16 @@ impl RenderOnce for TabBar {
         let container_height = Tab::container_height(cx);
 
         if self.wrap {
-            // Buttons participate in the wrapping flow: nav buttons first, pane
-            // buttons last. Row 1 shares horizontal space with them; rows 2..N span
-            // the full width. Bottom borders come from three cooperating sources,
-            // mirroring the single-row layout: the absolute overlay behind
-            // everything (covers the drop target and any gap), each button
-            // container's own border, and each inactive tab's own border. The
-            // lines coincide pixel-for-pixel, so nothing doubles.
-            return h_flex()
+            // Manual row layout: children are pre-built row containers (the
+            // pane computes rows from natural tab widths); this bar only
+            // stacks them, anchors the CTAs top-right, and reports its
+            // bounds. No flex_wrap (pure flexbox cannot reserve capacity on
+            // the first row only), no padding reserve (row 1 carries its own
+            // right padding), no strips.
+            return v_flex()
                 .id(self.id)
                 .group("tab_bar")
-                .flex_wrap()
                 .relative()
-                // Clips the absolute row-fill strips, whose placement is one
-                // frame stale: during a drag a strip may overhang the right
-                // edge by a few px for one frame.
                 .overflow_hidden()
                 .flex_none()
                 .w_full()
@@ -146,7 +157,7 @@ impl RenderOnce for TabBar {
                 .child(
                     div()
                         .absolute()
-                        .top_0()
+                        .bottom_0()
                         .left_0()
                         .size_full()
                         .border_b_1()
@@ -167,29 +178,20 @@ impl RenderOnce for TabBar {
                     )
                 })
                 .when(!self.start_children.is_empty(), |this| {
-                    this.child(
-                        h_flex()
-                            .flex_none()
-                            .h(container_height)
-                            .gap(DynamicSpacing::Base04.rems(cx))
-                            .px(DynamicSpacing::Base06.rems(cx))
-                            .border_r_1()
-                            .border_b_1()
-                            .border_color(border_color)
-                            .children(self.start_children),
-                    )
+                    // Wrap mode renders nav buttons INSIDE row 1 (pane-built);
+                    // start_children reaching here is a programming error.
+                    log::warn!("TabBar wrap mode received start_children; they are ignored (nav belongs to row 1)");
+                    this
                 })
                 .children(self.children)
                 .when(!self.end_children.is_empty(), |this| {
-                    // Pane buttons anchor at the top-right corner in wrap mode
-                    // (matching every non-wrap layout) rather than flowing at
-                    // the end of the last row (which would move them whenever
-                    // the row count changes). Out of the wrap flow; the layout
-                    // reserves the first row's right edge via the reported
-                    // width so tabs never slide underneath.
+                    // CTAs anchor top-right, always laid out (hidden via
+                    // visibility on unfocused panes so their width — and the
+                    // row-1 reservation — is focus-independent).
                     this.child(
                         h_flex()
                             .id("wrap_bar_actions")
+                            .when(self.wrap_actions_invisible, |this| this.invisible())
                             .absolute()
                             .top_0()
                             .right_0()
@@ -201,7 +203,7 @@ impl RenderOnce for TabBar {
                             .bg(cx.theme().colors().tab_bar_background)
                             .border_color(border_color)
                             .children(self.end_children)
-                            .when_some(self.actions_width_reporter, |this, report| {
+                            .when_some(self.report_actions_bounds, |this, report| {
                                 this.child(
                                     canvas(
                                         move |bounds: Bounds<Pixels>,
@@ -354,6 +356,135 @@ impl Component for TabBar {
 mod wrap_grow_tests {
     use gpui::{TestAppContext, div, px, size};
     use crate::prelude::*;
+
+    /// Does a canvas inside a `visibility: hidden` subtree still prepaint
+    /// (fire its reporting callback)? Decides whether wrap-mode CTA width
+    /// measurement can live inside an invisibly-gated actions container.
+    #[gpui::test]
+    fn canvas_fires_inside_invisible(cx: &mut TestAppContext) {
+        use std::rc::Rc;
+        use std::cell::Cell;
+        use gpui::canvas;
+        let fired = Rc::new(Cell::new(0));
+        let cx = cx.add_empty_window();
+        cx.draw(gpui::Point::default(), size(px(300.), px(100.)), |_, _| {
+            let fired = fired.clone();
+            div()
+                .id("root")
+                .child(
+                    h_flex()
+                        .id("hidden_actions")
+                        .invisible()
+                        .h(px(28.))
+                        .px_2()
+                        .child(div().w(px(60.)).h(px(28.)))
+                        .child(
+                            canvas(
+                                move |_: gpui::Bounds<gpui::Pixels>, _: &mut gpui::Window, _: &mut gpui::App| {
+                                    fired.set(fired.get() + 1);
+                                },
+                                |_: gpui::Bounds<gpui::Pixels>, _: (), _: &mut gpui::Window, _: &mut gpui::App| {},
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        ),
+                )
+        });
+        assert!(
+            fired.get() > 0,
+            "canvas inside invisible subtree should still prepaint, fired {}",
+            fired.get()
+        );
+    }
+
+    /// Does a zero-height rigid flow item consume its line's capacity in a
+    /// flex_wrap container (i.e., force later items to wrap earlier)? This is
+    /// the linchpin for row-1-only actions-zone reservation: a head spacer
+    /// must shrink ROW 1's tab capacity without affecting rows 2..N.
+    #[gpui::test]
+    fn head_spacer_consumes_first_line_capacity(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.draw(gpui::Point::default(), size(px(150.), px(100.)), |_, _| {
+            crate::h_flex()
+                .id("bar")
+                .flex_wrap()
+                .w_full()
+                .child(
+                    div()
+                        .id("nav")
+                        .flex_none()
+                        .h(px(28.))
+                        .w(px(30.))
+                        .debug_selector(|| "nav".into()),
+                )
+                .child(
+                    div()
+                        .id("spacer")
+                        .flex_none()
+                        .h_0()
+                        .w(px(50.))
+                        .debug_selector(|| "spacer".into()),
+                )
+                // 4 tabs of 40px: without the spacer, row 1 fits
+                // nav(30)+3*40=150 exactly; with the spacer (50), row 1 fits
+                // nav+spacer+one tab = 120, second tab (80 more) must wrap.
+                .child(div().id("t0").h(px(28.)).w(px(40.)).debug_selector(|| "t0".into()))
+                .child(div().id("t1").h(px(28.)).w(px(40.)).debug_selector(|| "t1".into()))
+                .child(div().id("t2").h(px(28.)).w(px(40.)).debug_selector(|| "t2".into()))
+                .child(div().id("t3").h(px(28.)).w(px(40.)).debug_selector(|| "t3".into()))
+        });
+        // nav(30) + spacer(50) + t0(40) = 120 fits row 1; t1 would end at
+        // 160 > 150, so the spacer forces t1 to wrap.
+        let t0 = cx.debug_bounds("t0").expect("t0");
+        let t1 = cx.debug_bounds("t1").expect("t1");
+        assert_ne!(
+            t0.origin.y, t1.origin.y,
+            "spacer must consume row-1 capacity: t1 (would end at 160 > 150) wraps"
+        );
+        // Row 2 starts at the container's left edge (spacer affects only row 1).
+        assert_eq!(t1.origin.x, px(0.), "row 2 spans from the left edge");
+    }
+
+    /// Does an absolute `size_full` child report the PADDING box (padding
+    /// included) or the content box? Decides whether static
+    /// `padding_right(reserve)` + strips positioned to the reported right
+    /// edge works (strips reach the visual bar edge) or stops short.
+    #[gpui::test]
+    fn absolute_child_reports_padding_box(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.draw(gpui::Point::default(), size(px(300.), px(100.)), |_, _| {
+            crate::h_flex()
+                .id("bar")
+                .relative()
+                .w_full()
+                .pr(px(80.))
+                .h(px(28.))
+                .child(
+                    div()
+                        .id("probe")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .debug_selector(|| "probe".into()),
+                )
+                .child(
+                    div()
+                        .id("content")
+                        .w(px(50.))
+                        .h(px(28.))
+                        .debug_selector(|| "content".into()),
+                )
+        });
+        let probe = cx.debug_bounds("probe").expect("probe renders");
+        eprintln!("PADBOX probe right={:?} width={:?}", probe.right(), probe.size.width);
+        assert!(
+            probe.size.width > px(250.),
+            "absolute size_full child should span the padding box (~300), got {probe:?}"
+        );
+    }
 
     /// Confirms the filler-strip mechanism: an EMPTY flex item with
     /// `flex_grow_1` (plus an ABSOLUTE child, which never participates in flex
