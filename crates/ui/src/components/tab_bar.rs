@@ -16,11 +16,6 @@ pub struct TabBar {
     wrap: bool,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
     report_actions_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
-    /// Paint gate for the always-laid-out actions container (wrap layout):
-    /// Zed hides pane CTAs on unfocused panes; hiding via `visibility` keeps
-    /// the container (and its width reporter) laid out, so focus changes
-    /// never shift the layout.
-    wrap_actions_invisible: bool,
 }
 
 impl TabBar {
@@ -34,7 +29,6 @@ impl TabBar {
             wrap: false,
             report_bounds: None,
             report_actions_bounds: None,
-            wrap_actions_invisible: false,
         }
     }
 
@@ -64,12 +58,6 @@ impl TabBar {
         self
     }
 
-    /// Hides the wrap-mode actions container from paint while keeping it laid
-    /// out (used when the pane is unfocused; Zed gates pane CTAs on focus).
-    pub fn wrap_actions_invisible(mut self, invisible: bool) -> Self {
-        self.wrap_actions_invisible = invisible;
-        self
-    }
 
 
 
@@ -134,6 +122,8 @@ impl ParentElement for TabBar {
     }
 }
 
+
+
 impl RenderOnce for TabBar {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let border_color = cx.theme().colors().border;
@@ -185,13 +175,16 @@ impl RenderOnce for TabBar {
                 })
                 .children(self.children)
                 .when(!self.end_children.is_empty(), |this| {
-                    // CTAs anchor top-right, always laid out (hidden via
-                    // visibility on unfocused panes so their width — and the
-                    // row-1 reservation — is focus-independent).
+                    // CTAs anchor top-right. The CONTAINER (background,
+                    // borders, width reporter) always paints: its border_b is
+                    // part of the bar's bottom border line, and hiding it on
+                    // unfocused panes would leave a gap in that line. The
+                    // PANE hides the buttons themselves (visibility on the
+                    // delivered end_children) so the measured width stays
+                    // focus-independent.
                     this.child(
                         h_flex()
                             .id("wrap_bar_actions")
-                            .when(self.wrap_actions_invisible, |this| this.invisible())
                             .absolute()
                             .top_0()
                             .right_0()

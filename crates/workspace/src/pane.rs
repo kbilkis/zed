@@ -4016,12 +4016,8 @@ impl Pane {
         cx: &mut Context<Pane>,
     ) -> TabBar {
         let wrap = TabBarSettings::get_global(cx).wrap_tabs;
-        // Zed hides pane CTAs on unfocused panes. In wrap mode the actions
-        // container must STAY laid out (hidden via `visibility`) so its width
-        // — and therefore the first-row reservation — is identical focused or
-        // not: focusing a pane must not reflow its tab rows.
-        let actions_visible =
-            self.has_focus(window, cx) || self.context_menu_focused(window, cx);
+        // Zed hides pane CTAs on unfocused panes; the wrap branch below
+        // applies visibility to the BUTTONS (container always paints).
         tab_bar
             .when(
                 self.display_nav_history_buttons.unwrap_or_default(),
@@ -4035,18 +4031,25 @@ impl Pane {
                 if self.show_tab_bar_buttons {
                     let render_tab_buttons = self.render_tab_bar_buttons.clone();
                     let (left_children, right_children) = if wrap {
+                        // Wrap mode: buttons hide via visibility when
+                        // unfocused (container always paints — see
+                        // attach_wrap_ctas).
+                        let actions_visible = self.has_focus(window, cx)
+                            || self.context_menu_focused(window, cx);
                         let (left, right) =
                             render_tab_bar_buttons_laid_out(self, window, cx);
+                        let right = right.map(|child| {
+                            if actions_visible {
+                                child
+                            } else {
+                                div().invisible().child(child).into_any_element()
+                            }
+                        });
                         (left, right)
                     } else {
                         render_tab_buttons(self, window, cx)
                     };
-                    tab_bar
-                        .start_children(left_children)
-                        .end_children(right_children)
-                        .when(wrap, |tab_bar| {
-                            tab_bar.wrap_actions_invisible(!actions_visible)
-                        })
+                    tab_bar.start_children(left_children).end_children(right_children)
                 } else {
                     tab_bar
                 }
@@ -4279,14 +4282,22 @@ impl Pane {
         let actions_visible =
             self.has_focus(window, cx) || self.context_menu_focused(window, cx);
         let (left_children, right_children) = render_tab_bar_buttons_laid_out(self, window, cx);
-        // Left children (if any custom pane provides them) join row 0 via
-        // start_children being ignored in wrap mode — render them into the
-        // ruler strip? Custom panes with left children are rare; append them
-        // invisibly to keep them laid out without breaking row layout.
+        // Left children (if any custom pane provides them) are ignored in
+        // wrap mode (row 0 is pane-built); custom panes with left children
+        // are rare.
         let _ = left_children;
-        tab_bar
-            .end_children(right_children)
-            .wrap_actions_invisible(!actions_visible)
+        // Buttons hide via visibility when the pane is unfocused — the
+        // CONTAINER (borders, background, width reporter) always paints, so
+        // the bar's bottom border line stays continuous and the row-1
+        // reservation is focus-independent.
+        let right_children = right_children.map(|child| {
+            if actions_visible {
+                child
+            } else {
+                div().invisible().child(child).into_any_element()
+            }
+        });
+        tab_bar.end_children(right_children)
     }
 
     fn render_single_row_tab_bar_non_wrap(
