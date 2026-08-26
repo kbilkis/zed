@@ -138,13 +138,7 @@ impl TerminalPanel {
                 let pane_visible =
                     pane.has_focus(window, cx) || pane.context_menu_focused(window, cx);
                 let (left, right) = if pane_visible || has_focused_rename_editor {
-                    Self::build_terminal_tab_bar_buttons(
-                        pane,
-                        assistant_enabled,
-                        split_context,
-                        window,
-                        cx,
-                    )
+                    Self::build_terminal_tab_bar_buttons(pane, assistant_enabled, split_context, cx)
                 } else if workspace::TabBarSettings::get_global(cx).wrap_tabs {
                     // Wrap mode keeps the buttons laid out (invisible) so the
                     // pane can measure their width for the row-1 reserve.
@@ -152,7 +146,6 @@ impl TerminalPanel {
                         pane,
                         assistant_enabled,
                         split_context,
-                        window,
                         cx,
                     );
                     (
@@ -174,7 +167,6 @@ impl TerminalPanel {
         pane: &mut Pane,
         assistant_enabled: bool,
         split_context: Option<gpui::FocusHandle>,
-        _window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> (Option<AnyElement>, Option<AnyElement>) {
         let focus_handle = pane.focus_handle(cx);

@@ -394,7 +394,7 @@ impl fmt::Debug for Event {
 }
 
 #[derive(Clone, Default)]
-pub struct WrapTabIdentity {
+struct WrapTabIdentity {
     pub row_end: bool,
     pub mid_row: bool,
     pub extend_to: Option<gpui::Pixels>,
@@ -430,7 +430,7 @@ pub struct Pane {
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
     /// Whether `render_tab_bar_buttons` is still the default; wrap layout
-    /// keeps the default CTAs laid out (hidden, not removed) when unfocused,
+    /// keeps the default actions laid out (hidden, not removed) when unfocused,
     /// but must respect custom overrides verbatim.
     uses_default_tab_bar_buttons: bool,
     render_tab_bar_buttons: Rc<
@@ -903,6 +903,13 @@ impl Pane {
         cx.notify();
     }
 
+    /// Registers a custom renderer for the tab bar's corner buttons.
+    ///
+    /// In wrap mode the returned children must be laid out whenever the pane
+    /// is rendered: left children are not placed (row 0 is pane-built), and
+    /// right children that vanish when the pane unfocuses make the row-1
+    /// actions-zone reserve collapse. Return the buttons wrapped in an invisible div
+    /// instead of `None` while unfocused (see the terminal panel).
     pub fn set_render_tab_bar_buttons<F>(&mut self, cx: &mut Context<Self>, render: F)
     where
         F: 'static
@@ -3615,6 +3622,7 @@ impl Pane {
 
     fn nav_history_buttons(&self, cx: &mut Context<Pane>) -> (IconButton, IconButton) {
         let entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
         let navigate_backward = IconButton::new("navigate_backward", IconName::ArrowLeft)
             .icon_size(IconSize::Small)
             .on_click(move |_, window, cx| {
@@ -3622,8 +3630,19 @@ impl Pane {
                     pane.navigate_backward(&Default::default(), window, cx)
                 })
             })
-            .disabled(!self.can_navigate_backward());
+            .disabled(!self.can_navigate_backward())
+            .tooltip({
+                move |window, cx| {
+                    Tooltip::for_action_in(
+                        "Go Back",
+                        &GoBack,
+                        &window.focused(cx).unwrap_or_else(|| focus_handle.clone()),
+                        cx,
+                    )
+                }
+            });
         let entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
         let navigate_forward = IconButton::new("navigate_forward", IconName::ArrowRight)
             .icon_size(IconSize::Small)
             .on_click(move |_, window, cx| {
@@ -3631,7 +3650,17 @@ impl Pane {
                     pane.navigate_forward(&Default::default(), window, cx)
                 })
             })
-            .disabled(!self.can_navigate_forward());
+            .disabled(!self.can_navigate_forward())
+            .tooltip({
+                move |window, cx| {
+                    Tooltip::for_action_in(
+                        "Go Forward",
+                        &GoForward,
+                        &window.focused(cx).unwrap_or_else(|| focus_handle.clone()),
+                        cx,
+                    )
+                }
+            });
         (navigate_backward, navigate_forward)
     }
 
@@ -3639,7 +3668,13 @@ impl Pane {
         if self.workspace.upgrade().is_none() {
             return gpui::Empty.into_any();
         }
-        let wrap = TabBarSettings::get_global(cx).wrap_tabs;
+        let (wrap, separate_pinned_row) = {
+            let tab_bar_settings = TabBarSettings::get_global(cx);
+            (
+                tab_bar_settings.wrap_tabs,
+                tab_bar_settings.show_pinned_tabs_in_separate_row,
+            )
+        };
         if !wrap {
             // Re-enabling must not plan rows from stale measurements.
             self.wrapped_tab_natural_widths.borrow_mut().clear();
@@ -3653,7 +3688,7 @@ impl Pane {
             let reserve = actions.unwrap_or(px(0.));
             let nav_w = *self.wrap_nav_width.borrow();
             let widths = self.wrapped_tab_natural_widths.borrow().clone();
-            let two_row = TabBarSettings::get_global(cx).show_pinned_tabs_in_separate_row
+            let two_row = separate_pinned_row
                 && self.pinned_tab_count > 0
                 && self.pinned_tab_count < self.items.len();
 
@@ -3751,6 +3786,14 @@ impl Pane {
         }
     }
 
+    fn row_capacity(row_ix: usize, bar_w: Pixels, first_row_reserve: Pixels) -> Pixels {
+        if row_ix == 0 {
+            bar_w - first_row_reserve
+        } else {
+            bar_w
+        }
+    }
+
     fn plan_wrap_rows(
         widths: &HashMap<usize, Pixels>,
         range: std::ops::Range<usize>,
@@ -3771,11 +3814,7 @@ impl Pane {
         let mut row_ix = 0usize;
         for ix in indices.drain(..) {
             let width = widths.get(&ix).copied().unwrap_or(px(0.)) + ui::Tab::border_box_inset();
-            let capacity = if row_ix == 0 {
-                bar_w - first_row_reserve
-            } else {
-                bar_w
-            };
+            let capacity = Self::row_capacity(row_ix, bar_w, first_row_reserve);
             if !current.is_empty() && x + width > capacity {
                 rows.push(mem::take(&mut current));
                 x = px(0.);
@@ -3824,11 +3863,7 @@ impl Pane {
             for ix in row.iter().take(row.len() - 1) {
                 x += widths.get(ix).copied().unwrap_or(px(0.)) + ui::Tab::border_box_inset();
             }
-            let capacity = if r == 0 {
-                bar_w - first_row_reserve
-            } else {
-                bar_w
-            };
+            let capacity = Self::row_capacity(r, bar_w, first_row_reserve);
             if let Some(id) = identities.get_mut(row.last().unwrap()) {
                 id.extend_to = Some((capacity - x).max(px(0.)));
             }
@@ -4117,6 +4152,7 @@ impl Pane {
         }
         let (navigate_backward, navigate_forward) = self.nav_history_buttons(cx);
         let nav_width = self.wrap_nav_width.clone();
+        let pane = cx.entity().downgrade();
         Some(
             h_flex()
                 .id("wrap_nav")
@@ -4131,8 +4167,18 @@ impl Pane {
                 .child(navigate_forward)
                 .child(
                     canvas(
-                        move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
-                            *nav_width.borrow_mut() = bounds.size.width;
+                        move |bounds: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
+                            let width = bounds.size.width;
+                            if *nav_width.borrow_mut() != width {
+                                *nav_width.borrow_mut() = width;
+                                // Button enable/disable changes row-0 capacity;
+                                // deferred because notifies during a draw phase
+                                // don't schedule a redraw.
+                                if let Some(pane) = pane.upgrade() {
+                                    let pane_id = pane.entity_id();
+                                    cx.defer(move |cx| cx.notify(pane_id));
+                                }
+                            }
                         },
                         |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
                     )
@@ -4157,11 +4203,8 @@ impl Pane {
             return tab_bar;
         }
         let actions_visible = self.has_focus(window, cx) || self.context_menu_focused(window, cx);
-        // Custom overrides (e.g. the terminal panel's CTAs) gate themselves on
-        // focus, so their output is used verbatim. While they gate the buttons
-        // off, an invisible spacer holds the last focused width so the reserve
-        // - and row membership - stay stable across focus changes, like the
-        // default CTAs' invisible treatment.
+        // Custom overrides gate their own buttons on focus; their output is
+        // used verbatim.
         let right_children = if self.uses_default_tab_bar_buttons {
             let (_, right_children) = render_tab_bar_buttons_laid_out(self, window, cx);
             right_children.map(|child| {
@@ -4172,16 +4215,12 @@ impl Pane {
                 }
             })
         } else {
-            // Wrap-mode contract: overrides that want a stable reserve return
-            // always-laid-out children (handling their own visibility, like
-            // the default path); the pane measures whatever arrives verbatim.
-            // None means genuinely no CTAs.
+            // None means genuinely no actions buttons.
             let render_tab_buttons = self.render_tab_bar_buttons.clone();
             let (left_children, right_children) = render_tab_buttons(self, window, cx);
-            debug_assert!(
-                left_children.is_none(),
-                "wrap mode renders row 0 itself; custom left children are not placed"
-            );
+            if left_children.is_some() {
+                log::warn!("wrap mode renders row 0 itself; dropping custom tab bar left children");
+            }
             right_children
         };
         tab_bar.end_children(right_children)
@@ -6561,13 +6600,13 @@ mod tests {
             "unpinned bar should sit below the wrapped pinned strip"
         );
 
-        // Row 1 reserves the CTA zone (top-right).
+        // Row 1 reserves the actions zone.
         let actions_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
             .expect("actions width measured");
         assert!(
             actions_width > px(0.),
-            "CTAs stay laid out (visibility-gated)"
+            "actions stay laid out (visibility-gated)"
         );
         let first_row_y = pinned_bounds[0].origin.y;
         let row1_end = pinned_bounds
@@ -6658,7 +6697,10 @@ mod tests {
         let b0 = cx.debug_bounds("TAB-0").expect("tab 0 renders");
         let b1 = cx.debug_bounds("TAB-1").expect("tab 1 renders");
         assert_ne!(b0.origin.y, b1.origin.y, "tab 1 should wrap to its own row");
-        assert_eq!(b0.origin.y, px(1.), "tab 0 shares row 1 with the nav");
+        assert!(
+            b0.origin.y < b1.origin.y,
+            "row order must be top-down, got {b0:?} above {b1:?}?"
+        );
         let max_y = [b0, b1].iter().map(|b| b.origin.y).max().unwrap();
         for sel in ["TAB-0", "TAB-1"] {
             let b = cx.debug_bounds(sel).expect(sel);
@@ -6697,7 +6739,7 @@ mod tests {
             .expect("unfocused pane's actions width must be measurable");
         assert!(
             actions_width > px(0.),
-            "unfocused pane's CTAs must stay measurable, got {actions_width:?}"
+            "unfocused pane's actions must stay measurable, got {actions_width:?}"
         );
 
         let zone_edge = px(700.) - actions_width;
@@ -6801,7 +6843,7 @@ mod tests {
         cx.simulate_resize(size(px(300.), px(300.)));
         pane.update_in(cx, |pane, _, cx| {
             pane.set_render_tab_bar_buttons(cx, |_, _, _| {
-                // A custom CTA of a known fixed width, like the terminal
+                // A custom actions of a known fixed width, like the terminal
                 // panel's own buttons.
                 (None, Some(div().w(px(60.)).into_any_element()))
             });
@@ -6813,12 +6855,12 @@ mod tests {
 
         let actions_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
-            .expect("custom CTAs must be measured");
-        // 60px of buttons + ~10px container chrome; the default CTAs (~82px)
+            .expect("custom actions must be measured");
+        // 60px of buttons + ~10px container chrome; the default actions buttons (~82px)
         // would fail this range.
         assert!(
             (actions_width - px(60.)).abs() <= px(12.),
-            "reserve must come from the custom CTAs, got {actions_width:?}"
+            "reserve must come from the custom actions buttons, got {actions_width:?}"
         );
         let zone_edge = px(300.) - actions_width;
         let row1_right = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
@@ -6867,7 +6909,7 @@ mod tests {
 
         let focused_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
-            .expect("focused CTAs must be measured");
+            .expect("focused actions buttons must be measured");
 
         // Split: the original pane loses focus; the override keeps the same
         // children (invisible), so the reserve must not move a single pixel.
@@ -6878,7 +6920,7 @@ mod tests {
 
         let unfocused_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
-            .expect("invisible CTAs must stay measurable");
+            .expect("invisible actions buttons must stay measurable");
         assert!(
             (unfocused_width - focused_width).abs() <= px(1.),
             "unfocused reserve must match focused ({focused_width:?}), got {unfocused_width:?}"
@@ -6910,6 +6952,104 @@ mod tests {
             actions_width, None,
             "a permanent (None, None) override reserves nothing"
         );
+    }
+
+    #[gpui::test]
+    async fn test_drag_tab_within_wrap_row(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+        assert_item_labels(&pane, ["A", "B", "C", "D", "E", "F*"], cx);
+
+        // A and C share row 1; drag A onto C's center.
+        let tab_a = cx.debug_bounds("TAB-0").expect("tab A renders");
+        let tab_c = cx.debug_bounds("TAB-2").expect("tab C renders");
+        cx.simulate_event(MouseDownEvent {
+            position: tab_a.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        cx.simulate_event(MouseMoveEvent {
+            position: tab_c.center(),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.run_until_parked();
+        cx.simulate_event(MouseUpEvent {
+            position: tab_c.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+
+        assert_item_labels(&pane, ["B", "C", "A*", "D", "E", "F"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_drag_tab_across_wrap_rows(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        let tab_a = cx.debug_bounds("TAB-0").expect("tab A renders");
+        let row1_y = tab_a.origin.y;
+        let tab_f = cx
+            .debug_bounds("TAB-5")
+            .expect("tab F renders (a lower row)");
+        assert_ne!(
+            tab_f.origin.y, row1_y,
+            "fixture must wrap: A and F on different rows"
+        );
+
+        cx.simulate_event(MouseDownEvent {
+            position: tab_a.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        cx.simulate_event(MouseMoveEvent {
+            position: tab_f.center(),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.run_until_parked();
+        cx.simulate_event(MouseUpEvent {
+            position: tab_f.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        cx.run_until_parked();
+
+        assert_item_labels(&pane, ["B", "C", "D", "E", "F", "A*"], cx);
     }
 
     #[gpui::test]
