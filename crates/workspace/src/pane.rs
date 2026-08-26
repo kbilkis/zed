@@ -429,6 +429,10 @@ pub struct Pane {
     can_toggle_zoom: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
+    /// Whether `render_tab_bar_buttons` is still the default; wrap layout
+    /// keeps the default CTAs laid out (hidden, not removed) when unfocused,
+    /// but must respect custom overrides verbatim.
+    uses_default_tab_bar_buttons: bool,
     render_tab_bar_buttons: Rc<
         dyn Fn(
             &mut Pane,
@@ -632,6 +636,7 @@ impl Pane {
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
+            uses_default_tab_bar_buttons: true,
             render_tab_bar: Rc::new(Self::render_tab_bar),
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
             display_nav_history_buttons: Some(
@@ -908,6 +913,7 @@ impl Pane {
             ) -> (Option<AnyElement>, Option<AnyElement>),
     {
         self.render_tab_bar_buttons = Rc::new(render);
+        self.uses_default_tab_bar_buttons = false;
         cx.notify();
     }
 
@@ -4151,16 +4157,33 @@ impl Pane {
             return tab_bar;
         }
         let actions_visible = self.has_focus(window, cx) || self.context_menu_focused(window, cx);
-        let (_, right_children) = render_tab_bar_buttons_laid_out(self, window, cx);
-        // Hide the buttons only: the container's bottom border completes
-        // the bar's border line.
-        let right_children = right_children.map(|child| {
-            if actions_visible {
-                child
-            } else {
-                div().invisible().child(child).into_any_element()
-            }
-        });
+        // Custom overrides (e.g. the terminal panel's CTAs) gate themselves on
+        // focus, so their output is used verbatim. While they gate the buttons
+        // off, an invisible spacer holds the last focused width so the reserve
+        // - and row membership - stay stable across focus changes, like the
+        // default CTAs' invisible treatment.
+        let right_children = if self.uses_default_tab_bar_buttons {
+            let (_, right_children) = render_tab_bar_buttons_laid_out(self, window, cx);
+            right_children.map(|child| {
+                if actions_visible {
+                    child
+                } else {
+                    div().invisible().child(child).into_any_element()
+                }
+            })
+        } else {
+            // Wrap-mode contract: overrides that want a stable reserve return
+            // always-laid-out children (handling their own visibility, like
+            // the default path); the pane measures whatever arrives verbatim.
+            // None means genuinely no CTAs.
+            let render_tab_buttons = self.render_tab_bar_buttons.clone();
+            let (left_children, right_children) = render_tab_buttons(self, window, cx);
+            debug_assert!(
+                left_children.is_none(),
+                "wrap mode renders row 0 itself; custom left children are not placed"
+            );
+            right_children
+        };
         tab_bar.end_children(right_children)
     }
 
@@ -6672,18 +6695,21 @@ mod tests {
         let actions_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
             .expect("unfocused pane's actions width must be measurable");
-        let reserve = pane.read_with(cx, |pane, _| *pane.wrap_actions_width.borrow());
         assert!(
-            reserve.unwrap_or(px(0.)) >= actions_width,
-            "reserve must track the measured actions width on the unfocused pane"
+            actions_width > px(0.),
+            "unfocused pane's CTAs must stay measurable, got {actions_width:?}"
         );
+
+        let zone_edge = px(700.) - actions_width;
+        let row1_right = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .filter_map(|s| cx.debug_bounds(s))
+            .map(|b| b.right())
+            .max()
+            .expect("tabs render");
         assert!(
-            pane.read_with(cx, |pane, _| pane
-                .wrap_actions_width
-                .borrow()
-                .unwrap_or(px(0.)))
-                >= actions_width,
-            "reserve must be applied on the unfocused pane"
+            row1_right <= zone_edge + px(2.),
+            "unfocused row-1 tabs must stay left of the zone edge ({zone_edge:?}), got {row1_right:?}"
         );
     }
 
@@ -6759,6 +6785,131 @@ mod tests {
             cx.simulate_resize(size(px(width), px(300.)));
             assert_stable_and_zoned(cx, px(width));
         }
+    }
+
+    #[gpui::test]
+    async fn test_wrap_respects_custom_tab_bar_buttons(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+        pane.update_in(cx, |pane, _, cx| {
+            pane.set_render_tab_bar_buttons(cx, |_, _, _| {
+                // A custom CTA of a known fixed width, like the terminal
+                // panel's own buttons.
+                (None, Some(div().w(px(60.)).into_any_element()))
+            });
+        });
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        let actions_width = pane
+            .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
+            .expect("custom CTAs must be measured");
+        // 60px of buttons + ~10px container chrome; the default CTAs (~82px)
+        // would fail this range.
+        assert!(
+            (actions_width - px(60.)).abs() <= px(12.),
+            "reserve must come from the custom CTAs, got {actions_width:?}"
+        );
+        let zone_edge = px(300.) - actions_width;
+        let row1_right = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
+            .iter()
+            .filter_map(|s| cx.debug_bounds(s))
+            .max_by_key(|b| b.right())
+            .map(|b| b.right())
+            .expect("tabs render");
+        assert!(
+            row1_right <= zone_edge + px(2.),
+            "row-1 tabs must respect the custom reserve ({zone_edge:?}), got {row1_right:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_wrap_custom_ctas_reserve_stable_across_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+        // Terminal-style override: always laid out; visibility handled by the
+        // override itself, exactly like the terminal panel in wrap mode.
+        pane.update_in(cx, |pane, _, cx| {
+            pane.set_render_tab_bar_buttons(cx, |pane, window, cx| {
+                let children = div().w(px(60.)).into_any_element();
+                if pane.has_focus(window, cx) {
+                    (None, Some(children))
+                } else {
+                    (
+                        None,
+                        Some(gpui::div().invisible().child(children).into_any_element()),
+                    )
+                }
+            });
+        });
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        let focused_width = pane
+            .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
+            .expect("focused CTAs must be measured");
+
+        // Split: the original pane loses focus; the override keeps the same
+        // children (invisible), so the reserve must not move a single pixel.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.split(SplitDirection::Right, SplitMode::EmptyPane, window, cx)
+        });
+        cx.run_until_parked();
+
+        let unfocused_width = pane
+            .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
+            .expect("invisible CTAs must stay measurable");
+        assert!(
+            (unfocused_width - focused_width).abs() <= px(1.),
+            "unfocused reserve must match focused ({focused_width:?}), got {unfocused_width:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_wrap_custom_ctas_none_override_means_no_reserve(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        set_wrap_tabs(cx, true);
+        cx.simulate_resize(size(px(300.), px(300.)));
+        pane.update_in(cx, |pane, _, cx| {
+            pane.set_render_tab_bar_buttons(cx, |_, _, _| (None, None));
+        });
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            add_labeled_item(&pane, label, false, cx);
+        }
+        cx.run_until_parked();
+
+        let actions_width = pane.read_with(cx, |pane, _| *pane.wrap_actions_width.borrow());
+        assert_eq!(
+            actions_width, None,
+            "a permanent (None, None) override reserves nothing"
+        );
     }
 
     #[gpui::test]

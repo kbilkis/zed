@@ -797,7 +797,8 @@ impl VsCodeSettings {
                 .read_str("workbench.editor.editorActionsLocation")
                 .and_then(|str| if str == "hidden" { Some(false) } else { None }),
             show_pinned_tabs_in_separate_row: None,
-            // Deliberately not mapped from VS Code's `workbench.editor.wrapTabs`.
+            // Not mapped: VS Code's `workbench.editor.wrapTabs` wraps at a
+            // fixed tab-count threshold, not on overflow.
             wrap_tabs: None,
         })
     }

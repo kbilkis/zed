@@ -300,21 +300,6 @@ impl Component for TabBar {
                             .into_any_element(),
                     )],
                 ),
-                example_group_with_title(
-                    "Wrap",
-                    vec![single_example(
-                        "Wrapped Tabs",
-                        TabBar::new("wrapped_tab_bar")
-                            .wrap(true)
-                            .child(Tab::new("tab1"))
-                            .child(Tab::new("tab2"))
-                            .child(Tab::new("tab3"))
-                            .child(Tab::new("tab4"))
-                            .child(Tab::new("tab5"))
-                            .child(Tab::new("tab6"))
-                            .into_any_element(),
-                    )],
-                ),
             ])
             .into_any_element()
     }
