@@ -1,13 +1,14 @@
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-use gpui::{AnyElement, Bounds, IntoElement, Pixels, Stateful, canvas};
+use gpui::{AnyElement, App, Bounds, IntoElement, Pixels, Stateful, canvas};
 use smallvec::SmallVec;
 
 use crate::prelude::*;
 
 const START_TAB_SLOT_SIZE: Pixels = px(12.);
 const END_TAB_SLOT_SIZE: Pixels = px(14.);
+const TAB_EDGE_WIDTH: Pixels = px(1.);
 
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -40,11 +41,10 @@ pub struct Tab {
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
     wrap: bool,
-    /// Whether this tab sits in a wrap row that has another row below it.
     wrap_mid_row: bool,
     wrap_row_end: bool,
     extend_to: Option<Pixels>,
-    report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
+    report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>, &mut App)>>,
 }
 
 impl Tab {
@@ -88,9 +88,7 @@ impl Tab {
         self
     }
 
-    /// Reports this tab's laid-out bounds each frame; values arrive one
-    /// layout pass late.
-    pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
+    pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>, &mut App)>) -> Self {
         self.report_bounds = Some(report);
         self
     }
@@ -121,6 +119,15 @@ impl Tab {
 
     pub fn container_height(cx: &App) -> Pixels {
         DynamicSpacing::Base32.px(cx)
+    }
+
+    pub fn border_box_inset() -> Pixels {
+        TAB_EDGE_WIDTH * 2.
+    }
+
+    pub fn extended_tab_label_chrome(cx: &App) -> Pixels {
+        // 2x slot + px padding (2) + inter-item gaps (3) + trailing pr (1).
+        START_TAB_SLOT_SIZE + END_TAB_SLOT_SIZE + DynamicSpacing::Base04.px(cx) * 6.
     }
 }
 
@@ -263,8 +270,8 @@ impl RenderOnce for Tab {
                     .when_some(self.report_bounds, |this, report| {
                         this.child(
                             canvas(
-                                move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
-                                    report(bounds)
+                                move |bounds: Bounds<Pixels>, _: &mut Window, cx: &mut App| {
+                                    report(bounds, cx)
                                 },
                                 |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
                             )
