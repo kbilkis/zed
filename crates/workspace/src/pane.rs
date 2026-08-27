@@ -429,9 +429,6 @@ pub struct Pane {
     can_toggle_zoom: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
-    /// Whether `render_tab_bar_buttons` is still the default; wrap layout
-    /// keeps the default actions laid out (hidden, not removed) when unfocused,
-    /// but must respect custom overrides verbatim.
     uses_default_tab_bar_buttons: bool,
     render_tab_bar_buttons: Rc<
         dyn Fn(
@@ -443,15 +440,11 @@ pub struct Pane {
     render_tab_bar: Rc<dyn Fn(&mut Pane, &mut Window, &mut Context<Pane>) -> AnyElement>,
     show_tab_bar_buttons: bool,
     max_tabs: Option<NonZeroUsize>,
-    /// Measured per frame by the ruler strip; one layout pass behind row
-    /// planning.
-    wrapped_tab_natural_widths: Rc<RefCell<HashMap<usize, Pixels>>>,
+    wrapped_tab_natural_widths: Rc<RefCell<HashMap<EntityId, Pixels>>>,
     wrap_main_bar_width: Rc<RefCell<Option<Pixels>>>,
     wrap_pinned_bar_width: Rc<RefCell<Option<Pixels>>>,
     wrap_nav_width: Rc<RefCell<Pixels>>,
     wrap_actions_width: Rc<RefCell<Option<Pixels>>>,
-    /// Widths rows were planned against; the settle canvas re-renders once
-    /// when the recorders diverge.
     wrap_planned_widths: Rc<RefCell<(Option<Pixels>, Option<Pixels>)>>,
     use_max_tabs: bool,
     _subscriptions: Vec<Subscription>,
@@ -905,11 +898,9 @@ impl Pane {
 
     /// Registers a custom renderer for the tab bar's corner buttons.
     ///
-    /// In wrap mode the returned children must be laid out whenever the pane
-    /// is rendered: left children are not placed (row 0 is pane-built), and
-    /// right children that vanish when the pane unfocuses make the row-1
-    /// actions-zone reserve collapse. Return the buttons wrapped in an invisible div
-    /// instead of `None` while unfocused (see the terminal panel).
+    /// In wrap mode, left children are not placed and right children must
+    /// stay laid out (wrap in an invisible div, not `None`) or the row-1
+    /// actions reserve collapses.
     pub fn set_render_tab_bar_buttons<F>(&mut self, cx: &mut Context<Self>, render: F)
     where
         F: 'static
@@ -1548,6 +1539,7 @@ impl Pane {
     fn update_active_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if TabBarSettings::get_global(cx).wrap_tabs {
             // Wrap layout has no horizontal scroll handle attached; nothing to scroll.
+            self.suppress_scroll = false;
             return;
         }
         if !self.is_tab_pinned(index) {
@@ -2991,10 +2983,8 @@ impl Pane {
             .preview_item_id
             .map(|id| id == item.item_id())
             .unwrap_or(false);
-        // Extended tabs scale their char budget to the extension; the ruler
-        // twin keeps the default so its width matches non-extended siblings.
         let max_title_len = identity.extend_to.filter(|_| !ruler).map(|width| {
-            let chrome = ui::Tab::extended_tab_label_chrome(cx);
+            let chrome = ui::Tab::extended_tab_label_chrome(cx, window.rem_size());
             let avail = (width - chrome).max(px(16.));
             let title = item.tab_content_text(detail, cx);
             let text_style = window.text_style();
@@ -3094,11 +3084,12 @@ impl Pane {
         )
         .when(wrap_tabs, |tab| {
             if ruler {
+                let item_id = item.item_id();
                 let recorder = self.wrapped_tab_natural_widths.clone();
                 let pane = cx.entity().downgrade();
                 tab.report_bounds(Rc::new(move |bounds, cx| {
                     let width = bounds.size.width;
-                    if recorder.borrow_mut().insert(ix, width) != Some(width) {
+                    if recorder.borrow_mut().insert(item_id, width) != Some(width) {
                         // Notifies raised during a draw phase don't
                         // schedule a redraw; defer this one out of it.
                         if let Some(pane) = pane.upgrade() {
@@ -3676,7 +3667,6 @@ impl Pane {
             )
         };
         if !wrap {
-            // Re-enabling must not plan rows from stale measurements.
             self.wrapped_tab_natural_widths.borrow_mut().clear();
         }
 
@@ -3687,13 +3677,18 @@ impl Pane {
             let actions = *self.wrap_actions_width.borrow();
             let reserve = actions.unwrap_or(px(0.));
             let nav_w = *self.wrap_nav_width.borrow();
-            let widths = self.wrapped_tab_natural_widths.borrow().clone();
+            let widths = {
+                let mut recorded = self.wrapped_tab_natural_widths.borrow_mut();
+                recorded.retain(|id, _| self.items.iter().any(|item| item.item_id() == *id));
+                recorded.clone()
+            };
             let two_row = separate_pinned_row
                 && self.pinned_tab_count > 0
                 && self.pinned_tab_count < self.items.len();
 
             if two_row {
                 let pinned_rows = Self::plan_wrap_rows(
+                    &self.items,
                     &widths,
                     0..self.pinned_tab_count,
                     *self.wrap_pinned_bar_width.borrow(),
@@ -3701,6 +3696,7 @@ impl Pane {
                     nav_w,
                 );
                 let unpinned_rows = Self::plan_wrap_rows(
+                    &self.items,
                     &widths,
                     self.pinned_tab_count..self.items.len(),
                     *self.wrap_main_bar_width.borrow(),
@@ -3718,6 +3714,7 @@ impl Pane {
                 )
             } else {
                 let rows = Self::plan_wrap_rows(
+                    &self.items,
                     &widths,
                     0..self.items.len(),
                     *self.wrap_main_bar_width.borrow(),
@@ -3794,8 +3791,17 @@ impl Pane {
         }
     }
 
+    fn tab_natural_width(
+        items: &[Box<dyn ItemHandle>],
+        widths: &HashMap<EntityId, Pixels>,
+        ix: usize,
+    ) -> Option<Pixels> {
+        widths.get(&items.get(ix)?.item_id()).copied()
+    }
+
     fn plan_wrap_rows(
-        widths: &HashMap<usize, Pixels>,
+        items: &[Box<dyn ItemHandle>],
+        widths: &HashMap<EntityId, Pixels>,
         range: std::ops::Range<usize>,
         bar_w: Option<Pixels>,
         first_row_reserve: Pixels,
@@ -3804,7 +3810,9 @@ impl Pane {
         let Some(bar_w) = bar_w else {
             return vec![];
         };
-        let mut indices: Vec<usize> = range.filter(|ix| widths.contains_key(ix)).collect();
+        let mut indices: Vec<usize> = range
+            .filter(|ix| Self::tab_natural_width(items, widths, *ix).is_some())
+            .collect();
         if indices.is_empty() {
             return vec![];
         }
@@ -3813,7 +3821,8 @@ impl Pane {
         let mut x = nav_w;
         let mut row_ix = 0usize;
         for ix in indices.drain(..) {
-            let width = widths.get(&ix).copied().unwrap_or(px(0.)) + ui::Tab::border_box_inset();
+            let width = Self::tab_natural_width(items, widths, ix).unwrap_or(px(0.))
+                + ui::Tab::border_box_inset();
             let capacity = Self::row_capacity(row_ix, bar_w, first_row_reserve);
             if !current.is_empty() && x + width > capacity {
                 rows.push(mem::take(&mut current));
@@ -3847,11 +3856,13 @@ impl Pane {
     }
 
     fn apply_wrap_extensions(
-        widths: &HashMap<usize, Pixels>,
+        items: &[Box<dyn ItemHandle>],
+        widths: &HashMap<EntityId, Pixels>,
         rows: &[Vec<usize>],
         identities: &mut HashMap<usize, WrapTabIdentity>,
         bar_w: Pixels,
-        first_row_reserve: Pixels,
+        planned_reserve: Pixels,
+        actions_visible: bool,
         nav_w: Pixels,
     ) {
         let last_row = rows.len().saturating_sub(1);
@@ -3861,9 +3872,20 @@ impl Pane {
             }
             let mut x = if r == 0 { nav_w } else { px(0.) };
             for ix in row.iter().take(row.len() - 1) {
-                x += widths.get(ix).copied().unwrap_or(px(0.)) + ui::Tab::border_box_inset();
+                x += Self::tab_natural_width(items, widths, *ix).unwrap_or(px(0.))
+                    + ui::Tab::border_box_inset();
             }
-            let capacity = Self::row_capacity(r, bar_w, first_row_reserve);
+            // Row membership always honors the reserve; only the row-0
+            // extension reclaims it while the actions are hidden.
+            let capacity = Self::row_capacity(
+                r,
+                bar_w,
+                if r == 0 && !actions_visible {
+                    px(0.)
+                } else {
+                    planned_reserve
+                },
+            );
             if let Some(id) = identities.get_mut(row.last().unwrap()) {
                 id.extend_to = Some((capacity - x).max(px(0.)));
             }
@@ -3957,7 +3979,7 @@ impl Pane {
     fn render_wrapped_tab_bar(
         &mut self,
         rows: Vec<Vec<usize>>,
-        widths: HashMap<usize, Pixels>,
+        widths: HashMap<EntityId, Pixels>,
         reserve: Pixels,
         nav_w: Pixels,
         window: &mut Window,
@@ -3966,7 +3988,16 @@ impl Pane {
         let details = tab_details(&self.items, window, cx);
         let mut identities = Self::wrap_identities(&rows);
         if let Some(&bar_w) = self.wrap_main_bar_width.borrow().as_ref() {
-            Self::apply_wrap_extensions(&widths, &rows, &mut identities, bar_w, reserve, nav_w);
+            Self::apply_wrap_extensions(
+                &self.items,
+                &widths,
+                &rows,
+                &mut identities,
+                bar_w,
+                reserve,
+                self.has_focus(window, cx) || self.context_menu_focused(window, cx),
+                nav_w,
+            );
         }
         let focus_handle = self.focus_handle.clone();
 
@@ -4023,7 +4054,7 @@ impl Pane {
         &mut self,
         pinned_rows: Vec<Vec<usize>>,
         unpinned_rows: Vec<Vec<usize>>,
-        widths: HashMap<usize, Pixels>,
+        widths: HashMap<EntityId, Pixels>,
         reserve: Pixels,
         nav_w: Pixels,
         window: &mut Window,
@@ -4035,11 +4066,13 @@ impl Pane {
         let mut pinned_ids = Self::wrap_identities(&pinned_rows);
         if let Some(&bar_w) = self.wrap_pinned_bar_width.borrow().as_ref() {
             Self::apply_wrap_extensions(
+                &self.items,
                 &widths,
                 &pinned_rows,
                 &mut pinned_ids,
                 bar_w,
                 reserve,
+                self.has_focus(window, cx) || self.context_menu_focused(window, cx),
                 nav_w,
             );
         }
@@ -4093,11 +4126,13 @@ impl Pane {
         let mut unpinned_ids = Self::wrap_identities(&unpinned_rows);
         if let Some(&bar_w) = self.wrap_main_bar_width.borrow().as_ref() {
             Self::apply_wrap_extensions(
+                &self.items,
                 &widths,
                 &unpinned_rows,
                 &mut unpinned_ids,
                 bar_w,
                 px(0.),
+                true,
                 px(0.),
             );
         }
@@ -4146,7 +4181,6 @@ impl Pane {
 
     fn wrap_nav_container(&self, cx: &mut Context<Pane>) -> Option<AnyElement> {
         if !self.display_nav_history_buttons.unwrap_or_default() {
-            // Reset so rows aren't planned against a phantom nav width.
             *self.wrap_nav_width.borrow_mut() = px(0.);
             return None;
         }
@@ -4171,9 +4205,8 @@ impl Pane {
                             let width = bounds.size.width;
                             if *nav_width.borrow_mut() != width {
                                 *nav_width.borrow_mut() = width;
-                                // Button enable/disable changes row-0 capacity;
-                                // deferred because notifies during a draw phase
-                                // don't schedule a redraw.
+                                // Deferred: notifies during a draw phase don't
+                                // schedule a redraw.
                                 if let Some(pane) = pane.upgrade() {
                                     let pane_id = pane.entity_id();
                                     cx.defer(move |cx| cx.notify(pane_id));
@@ -4203,8 +4236,6 @@ impl Pane {
             return tab_bar;
         }
         let actions_visible = self.has_focus(window, cx) || self.context_menu_focused(window, cx);
-        // Custom overrides gate their own buttons on focus; their output is
-        // used verbatim.
         let right_children = if self.uses_default_tab_bar_buttons {
             let (_, right_children) = render_tab_bar_buttons_laid_out(self, window, cx);
             right_children.map(|child| {
@@ -4215,7 +4246,6 @@ impl Pane {
                 }
             })
         } else {
-            // None means genuinely no actions buttons.
             let render_tab_buttons = self.render_tab_bar_buttons.clone();
             let (left_children, right_children) = render_tab_buttons(self, window, cx);
             if left_children.is_some() {
@@ -4223,7 +4253,9 @@ impl Pane {
             }
             right_children
         };
-        tab_bar.end_children(right_children)
+        tab_bar
+            .paint_actions(actions_visible)
+            .end_children(right_children)
     }
 
     fn configure_tab_bar_start(
@@ -4421,8 +4453,6 @@ impl Pane {
             .min_w_6()
             .h(Tab::container_height(cx))
             .flex_grow_1()
-            // Wrap tabs all draw their own right border; this left border
-            // would double it. Non-wrap's last pinned tab has none.
             .when(!TabBarSettings::get_global(cx).wrap_tabs, |this| {
                 this.border_l_1().border_color(cx.theme().colors().border)
             })
@@ -6358,7 +6388,6 @@ mod tests {
 
         set_wrap_tabs(cx, true);
 
-        // Narrow window forces wrap if many tabs are added.
         cx.simulate_resize(size(px(300.), px(300.)));
 
         for label in ["A", "B", "C", "D", "E", "F"] {
@@ -6387,7 +6416,6 @@ mod tests {
             "Later rows should start left of the nav-button-offset first row"
         );
 
-        // Minimal widths drive char budgets to their floor; must not panic.
         for width in [120., 90., 60., 40.] {
             cx.simulate_resize(size(px(width), px(300.)));
             cx.run_until_parked();
@@ -6415,7 +6443,6 @@ mod tests {
 
         cx.simulate_resize(size(px(400.), px(300.)));
 
-        // Several pinned tabs, then many unpinned tabs, wrap OFF, separate-row OFF.
         let item_a = add_labeled_item(&pane, "A", false, cx);
         let item_b = add_labeled_item(&pane, "B", false, cx);
         pane.update_in(cx, |pane, window, cx| {
@@ -6489,18 +6516,36 @@ mod tests {
             .max_by_key(|b| b.right())
             .unwrap();
         let zone_edge = px(300.) - actions_width;
-        // ±5px: sub-pixel canvas rounding through nav/tab accumulations.
         assert!(
             (row1_end.right() - zone_edge).abs() <= px(5.),
             "row-1 end tab should extend to the zone edge ({zone_edge:?}), got {row1_end:?}"
         );
 
-        // Rows below the first span the full bar width.
-        let lower_end = second_row.iter().max_by_key(|b| b.right()).unwrap();
-        assert!(
-            (lower_end.right() - px(300.)).abs() <= px(2.) || lower_end.right() < px(250.),
-            "lower rows either extend to the bar edge or are the final natural row, got {lower_end:?}"
-        );
+        let all_y: Vec<_> = {
+            let mut ys: Vec<_> = bounds.iter().map(|b| b.origin.y).collect();
+            ys.sort();
+            ys.dedup();
+            ys
+        };
+        let last_y = *all_y.last().unwrap();
+        for y in &all_y[1..] {
+            let row_end = bounds
+                .iter()
+                .filter(|b| b.origin.y == *y)
+                .max_by_key(|b| b.right())
+                .unwrap();
+            if *y == last_y {
+                assert!(
+                    row_end.right() <= px(300.) + px(2.),
+                    "final row must not overflow the bar, got {row_end:?}"
+                );
+            } else {
+                assert!(
+                    (row_end.right() - px(300.)).abs() <= px(2.),
+                    "mid rows extend to the bar edge, got {row_end:?}"
+                );
+            }
+        }
     }
 
     #[gpui::test]
@@ -6514,8 +6559,6 @@ mod tests {
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
         set_wrap_tabs(cx, true);
-        // 375 wraps six tabs (nav ~53 + 6*~44 + reserve ~82 > 375) but fits
-        // the five remaining after removal (~355 <= 375).
         cx.simulate_resize(size(px(375.), px(300.)));
 
         let items: Vec<_> = ["A", "B", "C", "D", "E", "F"]
@@ -6533,7 +6576,6 @@ mod tests {
             "expected two rows initially"
         );
 
-        // Remaining five tabs fit one row (5*42 <= 300).
         pane.update_in(cx, |pane, window, cx| {
             pane.close_item_by_id(items[1].item_id(), SaveIntent::Close, window, cx)
                 .detach_and_log_err(cx);
@@ -6564,7 +6606,6 @@ mod tests {
         set_pinned_tabs_separate_row(cx, true);
         cx.simulate_resize(size(px(300.), px(300.)));
 
-        // Wide labels so a handful of pinned tabs overflow the bar.
         let long = "pinned_with_a_rather_long_name.rs";
         let pinned_handles: Vec<_> = (0..6)
             .map(|_| add_labeled_item(&pane, long, false, cx))
@@ -6639,8 +6680,7 @@ mod tests {
         }
         cx.run_until_parked();
 
-        // Drag-resize pattern: no tab may exceed the bar mid-drag (a stale
-        // extension would shrink into a lone full-width row).
+        // No tab may exceed the bar mid-drag.
         for width in [560., 520., 480., 440., 350.] {
             cx.simulate_resize(size(px(width), px(300.)));
             cx.run_until_parked();
@@ -6658,7 +6698,6 @@ mod tests {
             }
         }
 
-        // Once the width settles, extensions reappear: row-end tabs extend.
         cx.run_until_parked();
         let ys: std::collections::HashSet<gpui::Pixels> = [
             "TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5", "TAB-6", "TAB-7",
@@ -6686,14 +6725,11 @@ mod tests {
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
         set_wrap_tabs(cx, true);
-        // Test-font labels render ~42px regardless of text: nav + tab 0 +
-        // reservation fit row 1, tab 1 wraps.
         cx.simulate_resize(size(px(200.), px(300.)));
         add_labeled_item(&pane, "one.rs", false, cx);
         add_labeled_item(&pane, "two.rs", false, cx);
         cx.run_until_parked();
 
-        // Tab 1 alone on row 2.
         let b0 = cx.debug_bounds("TAB-0").expect("tab 0 renders");
         let b1 = cx.debug_bounds("TAB-1").expect("tab 1 renders");
         assert_ne!(b0.origin.y, b1.origin.y, "tab 1 should wrap to its own row");
@@ -6701,14 +6737,12 @@ mod tests {
             b0.origin.y < b1.origin.y,
             "row order must be top-down, got {b0:?} above {b1:?}?"
         );
-        let max_y = [b0, b1].iter().map(|b| b.origin.y).max().unwrap();
-        for sel in ["TAB-0", "TAB-1"] {
-            let b = cx.debug_bounds(sel).expect(sel);
-            assert!(
-                b.origin.y <= max_y,
-                "no tab may sit below the last row: {b:?}"
-            );
-        }
+        let row_pitch = cx.update(|_, cx| ui::Tab::container_height(cx));
+        assert_eq!(
+            b1.origin.y - b0.origin.y,
+            row_pitch,
+            "exactly two rows, one container height apart"
+        );
     }
 
     #[gpui::test]
@@ -6721,9 +6755,8 @@ mod tests {
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
         set_wrap_tabs(cx, true);
-        cx.simulate_resize(size(px(700.), px(300.)));
+        cx.simulate_resize(size(px(300.), px(300.)));
 
-        // Split: the ORIGINAL pane loses focus to the new right pane.
         let _new_pane = pane.update_in(cx, |pane, window, cx| {
             pane.split(SplitDirection::Right, SplitMode::EmptyPane, window, cx)
         });
@@ -6732,8 +6765,6 @@ mod tests {
         }
         cx.run_until_parked();
 
-        // The unfocused pane's container is laid out invisibly, so its width
-        // is measured and the zone reserved — no reflow on focus change.
         let actions_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
             .expect("unfocused pane's actions width must be measurable");
@@ -6742,16 +6773,61 @@ mod tests {
             "unfocused pane's actions must stay measurable, got {actions_width:?}"
         );
 
-        let zone_edge = px(700.) - actions_width;
-        let row1_right = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
-            .iter()
-            .filter_map(|s| cx.debug_bounds(s))
-            .map(|b| b.right())
-            .max()
-            .expect("tabs render");
+        let selectors = ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"];
+        let tab_bounds = |cx: &mut gpui::VisualTestContext| -> Vec<gpui::Bounds<gpui::Pixels>> {
+            selectors
+                .iter()
+                .filter_map(|s| cx.debug_bounds(s))
+                .collect()
+        };
+        let row1_right = |bounds: &[gpui::Bounds<gpui::Pixels>]| {
+            let row1_y = bounds
+                .iter()
+                .map(|b| b.origin.y)
+                .min()
+                .expect("tabs render");
+            bounds
+                .iter()
+                .filter(|b| b.origin.y == row1_y)
+                .map(|b| b.right())
+                .max()
+                .expect("row 1 tabs")
+        };
+        let bar_w = pane
+            .read_with(cx, |pane, _| *pane.wrap_main_bar_width.borrow())
+            .expect("bar width measured");
+
+        let unfocused_bounds = tab_bounds(cx);
+        let unfocused_right = row1_right(&unfocused_bounds);
         assert!(
-            row1_right <= zone_edge + px(2.),
-            "unfocused row-1 tabs must stay left of the zone edge ({zone_edge:?}), got {row1_right:?}"
+            (unfocused_right - bar_w).abs() <= px(2.),
+            "unfocused row-1 end tab should extend to the bar edge ({bar_w:?}), got {unfocused_right:?}"
+        );
+
+        // Focusing must not reflow: same row membership, extension pulls back
+        // to the zone edge.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.focus_active_item(window, cx);
+        });
+        cx.run_until_parked();
+
+        let focused_bounds = tab_bounds(cx);
+        assert_eq!(
+            unfocused_bounds
+                .iter()
+                .map(|b| b.origin.y)
+                .collect::<Vec<_>>(),
+            focused_bounds
+                .iter()
+                .map(|b| b.origin.y)
+                .collect::<Vec<_>>(),
+            "focus change must not move tabs between rows"
+        );
+        let zone_edge = bar_w - actions_width;
+        let focused_right = row1_right(&focused_bounds);
+        assert!(
+            (focused_right - zone_edge).abs() <= px(5.),
+            "focused row-1 end tab should stop at the zone edge ({zone_edge:?}), got {focused_right:?}"
         );
     }
 
@@ -6772,7 +6848,6 @@ mod tests {
         cx.run_until_parked();
 
         let assert_stable_and_zoned = |cx: &mut gpui::VisualTestContext, width: gpui::Pixels| {
-            // An oscillating layout never produces two equal frames.
             cx.run_until_parked();
             let capture =
                 |cx: &mut gpui::VisualTestContext| -> Vec<Option<gpui::Bounds<gpui::Pixels>>> {
@@ -6785,8 +6860,7 @@ mod tests {
             cx.refresh().unwrap();
             cx.run_until_parked();
             let second = capture(cx);
-            // 1px tolerance: device-pixel snapping can alternate between
-            // frames; real oscillations move bounds by tens of pixels.
+            // 1px tolerance for device-pixel snapping.
             let within_tolerance = first.iter().zip(second.iter()).all(|(a, b)| match (a, b) {
                 (Some(a), Some(b)) => {
                     (a.origin.x - b.origin.x).abs() <= px(1.)
@@ -6801,8 +6875,6 @@ mod tests {
                 "layout must not oscillate at width {width:?}:\nF1 {first:?}\nF2 {second:?}"
             );
 
-            // Lower rows span the full bar width; the last row may fall
-            // short (natural width, no extension).
             let last_row_y = first
                 .iter()
                 .flatten()
@@ -6822,7 +6894,6 @@ mod tests {
             );
         };
 
-        // Sweep the borderline where the reservation flips row membership.
         for width in [260., 280., 300., 320., 340., 360.] {
             cx.simulate_resize(size(px(width), px(300.)));
             assert_stable_and_zoned(cx, px(width));
@@ -6843,8 +6914,6 @@ mod tests {
         cx.simulate_resize(size(px(300.), px(300.)));
         pane.update_in(cx, |pane, _, cx| {
             pane.set_render_tab_bar_buttons(cx, |_, _, _| {
-                // A custom actions of a known fixed width, like the terminal
-                // panel's own buttons.
                 (None, Some(div().w(px(60.)).into_any_element()))
             });
         });
@@ -6856,8 +6925,6 @@ mod tests {
         let actions_width = pane
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
             .expect("custom actions must be measured");
-        // 60px of buttons + ~10px container chrome; the default actions buttons (~82px)
-        // would fail this range.
         assert!(
             (actions_width - px(60.)).abs() <= px(12.),
             "reserve must come from the custom actions buttons, got {actions_width:?}"
@@ -6887,8 +6954,6 @@ mod tests {
 
         set_wrap_tabs(cx, true);
         cx.simulate_resize(size(px(300.), px(300.)));
-        // Terminal-style override: always laid out; visibility handled by the
-        // override itself, exactly like the terminal panel in wrap mode.
         pane.update_in(cx, |pane, _, cx| {
             pane.set_render_tab_bar_buttons(cx, |pane, window, cx| {
                 let children = div().w(px(60.)).into_any_element();
@@ -6911,8 +6976,6 @@ mod tests {
             .read_with(cx, |pane, _| *pane.wrap_actions_width.borrow())
             .expect("focused actions buttons must be measured");
 
-        // Split: the original pane loses focus; the override keeps the same
-        // children (invisible), so the reserve must not move a single pixel.
         pane.update_in(cx, |pane, window, cx| {
             pane.split(SplitDirection::Right, SplitMode::EmptyPane, window, cx)
         });
@@ -6972,7 +7035,6 @@ mod tests {
         cx.run_until_parked();
         assert_item_labels(&pane, ["A", "B", "C", "D", "E", "F*"], cx);
 
-        // A and C share row 1; drag A onto C's center.
         let tab_a = cx.debug_bounds("TAB-0").expect("tab A renders");
         let tab_c = cx.debug_bounds("TAB-2").expect("tab C renders");
         cx.simulate_event(MouseDownEvent {
@@ -7069,7 +7131,6 @@ mod tests {
         }
         cx.run_until_parked();
 
-        // With wrap disabled, all tabs share one row (same y).
         let y_coords: std::collections::HashSet<gpui::Pixels> =
             ["TAB-0", "TAB-1", "TAB-2", "TAB-3", "TAB-4", "TAB-5"]
                 .iter()

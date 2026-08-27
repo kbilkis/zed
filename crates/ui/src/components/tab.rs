@@ -125,9 +125,13 @@ impl Tab {
         TAB_EDGE_WIDTH * 2.
     }
 
-    pub fn extended_tab_label_chrome(cx: &App) -> Pixels {
-        // 2x slot + px padding (2) + inter-item gaps (3) + trailing pr (1).
-        START_TAB_SLOT_SIZE + END_TAB_SLOT_SIZE + DynamicSpacing::Base04.px(cx) * 6.
+    pub fn extended_tab_label_chrome(cx: &App, rem_size: Pixels) -> Pixels {
+        // px paddings resolve against the UI font, gap rems against the
+        // window's rem size.
+        START_TAB_SLOT_SIZE
+            + END_TAB_SLOT_SIZE
+            + DynamicSpacing::Base04.px(cx) * 3.
+            + DynamicSpacing::Base04.rems(cx).to_pixels(rem_size) * 3.
     }
 }
 
@@ -189,17 +193,12 @@ impl RenderOnce for Tab {
 
         self.div
             .h(Tab::container_height(cx))
-            // No ellipsis to make room for; shrink only caused sub-pixel
-            // wobble at boundary widths.
             .when(self.wrap, |this| this.flex_none())
             .when_some(self.extend_to, |this, width| this.w(width))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
             .map(|this| {
                 if self.wrap {
-                    // Row-end tabs omit the right border: nothing sits to
-                    // their right, and drawing it would double the CTAs' left
-                    // border on row 1.
                     if self.selected {
                         if self.wrap_mid_row {
                             this.pl_px()
@@ -265,8 +264,6 @@ impl RenderOnce for Tab {
                             })
                             .child(end_slot),
                     )
-                    // The relative content box is the canvas's containing block, so
-                    // reported bounds track this tab, not an outer ancestor.
                     .when_some(self.report_bounds, |this, report| {
                         this.child(
                             canvas(

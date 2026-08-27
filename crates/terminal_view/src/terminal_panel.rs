@@ -140,8 +140,6 @@ impl TerminalPanel {
                 let (left, right) = if pane_visible || has_focused_rename_editor {
                     Self::build_terminal_tab_bar_buttons(pane, assistant_enabled, split_context, cx)
                 } else if workspace::TabBarSettings::get_global(cx).wrap_tabs {
-                    // Wrap mode keeps the buttons laid out (invisible) so the
-                    // pane can measure their width for the row-1 reserve.
                     let (left, right) = Self::build_terminal_tab_bar_buttons(
                         pane,
                         assistant_enabled,
@@ -157,7 +155,6 @@ impl TerminalPanel {
                 } else {
                     (None, None)
                 };
-                debug_assert!(left.is_none());
                 (left, right)
             });
         });

@@ -14,6 +14,9 @@ pub struct TabBar {
     end_children: SmallVec<[AnyElement; 2]>,
     scroll_handle: Option<ScrollHandle>,
     wrap: bool,
+    /// Whether the wrap-mode actions container paints its chrome; it stays
+    /// laid out (and measured) either way.
+    paint_actions: bool,
     report_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
     report_actions_bounds: Option<Rc<dyn Fn(Bounds<Pixels>)>>,
 }
@@ -27,6 +30,7 @@ impl TabBar {
             end_children: SmallVec::new(),
             scroll_handle: None,
             wrap: false,
+            paint_actions: true,
             report_bounds: None,
             report_actions_bounds: None,
         }
@@ -44,6 +48,11 @@ impl TabBar {
 
     pub fn report_bounds(mut self, report: Rc<dyn Fn(Bounds<Pixels>)>) -> Self {
         self.report_bounds = Some(report);
+        self
+    }
+
+    pub fn paint_actions(mut self, paint: bool) -> Self {
+        self.paint_actions = paint;
         self
     }
 
@@ -118,7 +127,6 @@ impl RenderOnce for TabBar {
         let container_height = Tab::container_height(cx);
 
         if self.wrap {
-            // Rows are planned and built by the pane; the bar stacks them.
             return v_flex()
                 .id(self.id)
                 .group("tab_bar")
@@ -152,9 +160,6 @@ impl RenderOnce for TabBar {
                 })
                 .children(self.children)
                 .when(!self.end_children.is_empty(), |this| {
-                    // Container keeps painting even unfocused (its bottom
-                    // border completes the bar's); the pane hides only the
-                    // buttons.
                     this.child(
                         h_flex()
                             .id("wrap_bar_actions")
@@ -164,10 +169,12 @@ impl RenderOnce for TabBar {
                             .h(container_height)
                             .gap(DynamicSpacing::Base04.rems(cx))
                             .px(DynamicSpacing::Base06.rems(cx))
-                            .border_l_1()
-                            .border_b_1()
-                            .bg(cx.theme().colors().tab_bar_background)
-                            .border_color(border_color)
+                            .when(self.paint_actions, |this| {
+                                this.border_l_1()
+                                    .border_b_1()
+                                    .bg(cx.theme().colors().tab_bar_background)
+                                    .border_color(border_color)
+                            })
                             .children(self.end_children)
                             .when_some(self.report_actions_bounds, |this, report| {
                                 this.child(
