@@ -3,8 +3,7 @@ name: personal build
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 5 1 * *"
-    - cron: "0 5 15 * *"
+    - cron: "0 5 * * *"
 
 permissions:
   contents: write
@@ -18,6 +17,7 @@ jobs:
         with: { fetch-depth: 0 }
 
       - name: sync with latest stable release and rebuild patches
+        id: sync
         run: |
           git config user.name "ci"
           git config user.email "ci@users.noreply.github.com"
@@ -25,17 +25,32 @@ jobs:
           git fetch upstream main --tags --no-recurse-submodules
           BASE=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           echo "basing on $BASE"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
           git rebase "$BASE"
           git push --force-with-lease origin personal
 
+          # Scheduled runs skip when the latest release already covers this
+          # base; manual runs always build.
+          if [ "${{ github.event_name }}" = "schedule" ] \\
+            && gh release view --repo kbilkis/zed --json body --jq .body \\
+            | grep -qF "Base: $BASE"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "no new stable release since $BASE; skipping build"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - uses: Swatinem/rust-cache@v2
+        if: steps.sync.outputs.skip != 'true'
         with:
           cache-on-failure: true
 
       - name: build
+        if: steps.sync.outputs.skip != 'true'
         run: ./script/bundle-mac
 
       - name: release
+        if: steps.sync.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -43,10 +58,10 @@ jobs:
           gh release create "$TAG" --repo kbilkis/zed \
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
             --title "Zed-wrap $TAG" --latest \
-            --notes "Zed-wrap build: latest stable Zed release + tab wrapping (tab_bar.wrap_tabs) + GitHub auto-update."
+            --notes "Zed-wrap build. Base: ${{ steps.sync.outputs.base }}. Tab wrapping (tab_bar.wrap_tabs) + GitHub auto-update."
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: steps.sync.outputs.skip != 'true'
         with:
           name: Zed-dmg
           path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
