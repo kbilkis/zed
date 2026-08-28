@@ -31,8 +31,8 @@ jobs:
 
           # Scheduled runs skip when the latest release already covers this
           # base; manual runs always build.
-          if [ "${{ github.event_name }}" = "schedule" ] \\
-            && gh release view --repo kbilkis/zed --json body --jq .body \\
+          if [ "${{ github.event_name }}" = "schedule" ] \
+            && gh release view --repo kbilkis/zed --json body --jq .body \
             | grep -qF "Base: $BASE"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "no new stable release since $BASE; skipping build"
