@@ -42,8 +42,8 @@ jobs:
           TAG="v$(date +%Y.%-m.%-d).${{ github.run_number }}"
           gh release create "$TAG" --repo kbilkis/zed \
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
-            --title "Zed personal $TAG" --latest \
-            --notes "Automated build of personal branch (latest stable release + wrap_tabs + fork auto-update)."
+            --title "Zed-wrap $TAG" --latest \
+            --notes "Zed-wrap build: latest stable Zed release + tab wrapping (tab_bar.wrap_tabs) + GitHub auto-update."
 
       - uses: actions/upload-artifact@v4
         if: always()
