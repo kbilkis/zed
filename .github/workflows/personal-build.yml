@@ -12,7 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -29,6 +29,8 @@ jobs:
           git push --force-with-lease origin personal
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: build
         run: ./script/bundle-mac
