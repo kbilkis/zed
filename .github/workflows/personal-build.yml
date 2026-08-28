@@ -1,0 +1,48 @@
+name: personal build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 1 * *"
+    - cron: "0 5 15 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: sync with upstream and rebuild patches
+        run: |
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+          git rebase upstream/main
+          git push --force-with-lease origin personal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: ./script/bundle-mac
+
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$(date +%Y.%-m.%-d).${{ github.run_number }}"
+          gh release create "$TAG" \
+            target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
+            --title "Zed personal $TAG" --latest \
+            --notes "Automated build of personal branch (upstream main + wrap_tabs + fork auto-update)."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Zed-dmg
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
