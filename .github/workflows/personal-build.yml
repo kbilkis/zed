@@ -40,7 +40,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v$(date +%Y.%-m.%-d).${{ github.run_number }}"
-          gh release create "$TAG" \
+          gh release create "$TAG" --repo kbilkis/zed \
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
             --title "Zed personal $TAG" --latest \
             --notes "Automated build of personal branch (latest stable release + wrap_tabs + fork auto-update)."
