@@ -1,7 +1,9 @@
-# Zed
+# Zed-wrap
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+
+Personal build of [Zed](https://zed.dev) with one addition: tabs wrap onto multiple rows instead of scrolling (`tab_bar.wrap_tabs`). Everything else is upstream Zed, rebased onto the latest stable release.
 
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
