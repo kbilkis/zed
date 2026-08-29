@@ -103,6 +103,10 @@ impl AppVersion {
     ) -> Version {
         let mut version: Version = if let Ok(from_env) = env::var("ZED_APP_VERSION") {
             from_env.parse().expect("invalid ZED_APP_VERSION")
+        } else if let Some(from_build) = option_env!("ZED_APP_VERSION") {
+            // Baked at compile time by release builds, so the running
+            // version matches the release it came from.
+            from_build.parse().expect("invalid ZED_APP_VERSION")
         } else {
             pkg_version.parse().expect("invalid version in Cargo.toml")
         };

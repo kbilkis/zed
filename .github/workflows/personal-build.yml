@@ -45,16 +45,29 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: compute release version
+        if: steps.sync.outputs.skip != 'true'
+        run: |
+          TAG="v1.$(date +%Y%m%d).${{ github.run_number }}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "ZED_APP_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "release $TAG (app version ${TAG#v})"
+
       - name: build
         if: steps.sync.outputs.skip != 'true'
-        run: ./script/bundle-mac
+        env:
+          ZED_APP_VERSION: ${{ env.ZED_APP_VERSION }}
+        run: |
+          # option_env! is not a cargo fingerprint input; force the crate
+          # holding the baked version to recompile.
+          touch crates/release_channel/src/lib.rs
+          ./script/bundle-mac
 
       - name: release
         if: steps.sync.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.$(date +%Y%m%d).${{ github.run_number }}"
           gh release create "$TAG" --repo kbilkis/zed \
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
             --title "Zed-wrap $TAG" --latest \

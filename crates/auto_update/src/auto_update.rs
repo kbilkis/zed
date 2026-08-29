@@ -713,7 +713,7 @@ impl AutoUpdater {
                 browser_download_url: String,
             }
 
-            let mut request = http_client::http::Request::builder()
+            let request = http_client::http::Request::builder()
                 .uri("https://api.github.com/repos/kbilkis/zed/releases/latest")
                 .header("User-Agent", "zed")
                 .header("Accept", "application/vnd.github+json")
