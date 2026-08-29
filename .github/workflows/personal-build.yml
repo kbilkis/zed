@@ -54,7 +54,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v$(date +%Y.%-m.%-d).${{ github.run_number }}"
+          TAG="v1.$(date +%Y%m%d).${{ github.run_number }}"
           gh release create "$TAG" --repo kbilkis/zed \
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
             --title "Zed-wrap $TAG" --latest \
