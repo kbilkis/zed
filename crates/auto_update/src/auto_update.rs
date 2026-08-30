@@ -714,7 +714,7 @@ impl AutoUpdater {
             }
 
             let request = http_client::http::Request::builder()
-                .uri("https://api.github.com/repos/kbilkis/zed/releases/latest")
+                .uri("https://api.github.com/repos/kbilkis/zed-WITH-TAB-WRAPPING/releases/latest")
                 .header("User-Agent", "zed")
                 .header("Accept", "application/vnd.github+json")
                 .body(http_client::AsyncBody::empty())?;

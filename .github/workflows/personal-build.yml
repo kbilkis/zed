@@ -23,7 +23,8 @@ jobs:
           git config user.email "ci@users.noreply.github.com"
           git remote add upstream https://github.com/zed-industries/zed.git
           git fetch upstream main --tags --no-recurse-submodules
-          BASE=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          BASE=$(git ls-remote --tags upstream 'v*' \
+            | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           echo "basing on $BASE"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           git rebase "$BASE"
@@ -32,7 +33,7 @@ jobs:
           # Scheduled runs skip when the latest release already covers this
           # base; manual runs always build.
           if [ "${{ github.event_name }}" = "schedule" ] \
-            && gh release view --repo kbilkis/zed --json body --jq .body \
+            && gh release view --repo kbilkis/zed-WITH-TAB-WRAPPING --json body --jq .body \
             | grep -qF "Base: $BASE"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "no new stable release since $BASE; skipping build"
@@ -68,7 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" --repo kbilkis/zed \
+          gh release create "$TAG" --repo kbilkis/zed-WITH-TAB-WRAPPING \
             target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
             --title "Zed-wrap $TAG" --latest \
             --notes "Zed-wrap build. Base: ${{ steps.sync.outputs.base }}. Tab wrapping (tab_bar.wrap_tabs) + GitHub auto-update."
