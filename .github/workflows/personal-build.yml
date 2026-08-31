@@ -3,7 +3,7 @@ name: personal build
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 5 * * *"
+    - cron: "23 5 * * *"
 
 permissions:
   contents: write
