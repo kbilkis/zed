@@ -1,0 +1,12 @@
+name: schedule probe 2
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe2 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
