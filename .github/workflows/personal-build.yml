@@ -3,7 +3,7 @@ name: personal build
 on:
   workflow_dispatch:
   schedule:
-    - cron: "23 5 * * *"
+    - cron: "41 5 * * *"
 
 permissions:
   contents: write
@@ -28,6 +28,14 @@ jobs:
           echo "basing on $BASE"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           git rebase "$BASE"
+
+          # Upstream workflows carry schedule triggers that all skip on this
+          # fork; drop them so only our schedule is registered.
+          for f in .github/workflows/*.yml; do
+            [ "$(basename "$f")" = "personal-build.yml" ] && continue
+            if grep -q "schedule:" "$f"; then git rm -q "$f"; fi
+          done
+          git commit -qm "ci: drop upstream scheduled workflows" || true
           git push --force-with-lease origin personal
 
           # Scheduled runs skip when the latest release already covers this
