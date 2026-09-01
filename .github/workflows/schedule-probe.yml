@@ -1,0 +1,13 @@
+name: schedule probe
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Off the busy minutes: fires at :07, :27, :47
+    - cron: "*/5 * * * *"
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe $(date -u +%Y-%m-%dT%H:%M:%SZ)"
