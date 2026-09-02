@@ -697,6 +697,47 @@ impl AutoUpdater {
         };
         let http_client = client.http_client();
 
+        // Personal fork: the app itself is released on GitHub, so fetch the
+        // latest release manifest from the GitHub API instead of Zed's cloud.
+        // Remote-server assets still come from Zed's cloud. Tests use a local
+        // mock server, so they keep the cloud path.
+        if asset == "zed" && !cfg!(test) {
+            #[derive(Deserialize)]
+            struct GithubRelease {
+                tag_name: String,
+                assets: Vec<GithubAsset>,
+            }
+            #[derive(Deserialize)]
+            struct GithubAsset {
+                name: String,
+                browser_download_url: String,
+            }
+
+            let request = http_client::http::Request::builder()
+                .uri("https://api.github.com/repos/kbilkis/zed-WITH-TAB-WRAPPING/releases/latest")
+                .header("User-Agent", "zed")
+                .header("Accept", "application/vnd.github+json")
+                .body(http_client::AsyncBody::empty())?;
+            let mut response = http_client.send(request).await?;
+            let mut body = Vec::new();
+            response.body_mut().read_to_end(&mut body).await?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "failed to fetch latest release: {:?}",
+                String::from_utf8_lossy(&body),
+            );
+            let release: GithubRelease = serde_json::from_slice(&body)?;
+            let dmg = release
+                .assets
+                .iter()
+                .find(|asset| asset.name.ends_with(".dmg"))
+                .context("no dmg asset on the latest release")?;
+            return Ok(ReleaseAsset {
+                version: release.tag_name.trim_start_matches('v').to_string(),
+                url: dmg.browser_download_url.clone(),
+            });
+        }
+
         let path = format!("/releases/{}/{}/asset", release_channel.dev_name(), version,);
         let url = http_client.build_zed_cloud_url_with_query(
             &path,
