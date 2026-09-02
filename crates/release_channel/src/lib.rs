@@ -103,6 +103,10 @@ impl AppVersion {
     ) -> Version {
         let mut version: Version = if let Ok(from_env) = env::var("ZED_APP_VERSION") {
             from_env.parse().expect("invalid ZED_APP_VERSION")
+        } else if let Some(from_build) = option_env!("ZED_APP_VERSION") {
+            // Baked at compile time by release builds, so the running
+            // version matches the release it came from.
+            from_build.parse().expect("invalid ZED_APP_VERSION")
         } else {
             pkg_version.parse().expect("invalid version in Cargo.toml")
         };
@@ -199,13 +203,14 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        !matches!(self, ReleaseChannel::Dev)
+        // Personal fork: poll on dev builds too; releases come from our GitHub.
+        true
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
+            ReleaseChannel::Dev => "Zed-wrap",
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
